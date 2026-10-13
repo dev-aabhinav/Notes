@@ -45,6 +45,8 @@ child page id, unpins the current page and repeats until it reaches a leaf.
 | CMake + FetchContent | Build recipe that downloads its own test library | Reproducible on a fresh cloud box or laptop | Makefile: not portable; system-only GTest: breaks on fresh machines |
 | GoogleTest fixtures | Fresh table setup before each test | Each test gets its own file, no cross-test leakage | Catch2: also fine; GTest is the industry default |
 | ASan + UBSan build | A watchman for memory bugs | We `memcpy` into raw 4KB buffers; catches overflow/use-after-free | Valgrind memcheck: slower (~20–50x) |
+| LRU = `std::list` + `unordered_map<key, list::iterator>` | Study table with 3 slots; return the book untouched longest | O(1) get/put; the classic interview version | Single `unordered_map` + timestamps: eviction becomes O(n) scan (or O(log n) with a heap/set) |
+| Stress test vs brute force | Same as CP: compare fast solution with obviously-correct slow one on random input | Catches ordering bugs hand tests miss (caught a missing `splice` at op 81) | Only hand-written tests: miss rare interleavings |
 
 ---
 
@@ -69,6 +71,13 @@ child page id, unpins the current page and repeats until it reaches a leaf.
 binary `unit_tests`) and a `DiskManager` that reads/writes whole 4KB pages
 to one file with `pread`/`pwrite`, allocates page ids, and recovers its page
 count when the file is reopened.
+
+**Plain-language version (say this first)**
+A database must remember data after the program closes, so it lives in a file.
+A file is just one huge `char` array on disk, and disk is ~1000x slower than RAM,
+so we move it in fixed blocks of 4096 bytes (like sqrt-decomposition blocks).
+Page p = bytes `[p*4096, p*4096 + 4095]` (page 3 = bytes 12288..16383).
+`ReadPage`/`WritePage` = memcpy one block between disk and a RAM buffer.
 
 **MEMORISE**
 - `kPageSize = 4096` (`include/index_engine/config.h`)
@@ -120,6 +129,70 @@ count when the file is reopened.
 - No `O_DIRECT`: "cold" pool reads may still come from OS cache → state this in every cold benchmark, or use O_DIRECT / drop caches.
 - No checksums, no torn-page detection → CRC32 per page header.
 - Not thread-safe (counter races).
+
+### Milestone 2: LRU cache (textbook version)
+
+**What I built:** a generic header-only `LRUCache<K, V>` with O(1) `Get` and
+`Put`, using `std::list` (recency order) + `std::unordered_map` (key → list
+iterator) + `splice`. It is the interview version; the buffer pool will NOT
+use it (see weakness below and M3).
+
+**Plain-language version (say this first)**
+Study table with room for N books. Using a book moves it to the "most recent"
+end. Table full and you need a new book → send back the one untouched longest.
+The map finds a book instantly; the linked list remembers the order and can
+move any book to the front instantly, once the map has told you where it is.
+
+**MEMORISE**
+- File: `include/index_engine/lru_cache.h` (header-only template, no .cpp)
+- `std::list<std::pair<K,V>> items_` — front = most recent, back = victim
+- `std::unordered_map<K, list::iterator> index_` — `reserve(capacity)` in constructor (no rehash pauses)
+- `std::optional<V> Get(const K&)` — returns `nullopt` on miss (not `-1`, which could be a real value)
+- `void Put(const K&, const V&)` — update+refresh if present; else evict back if full, `emplace_front`
+- Hit/update: `items_.splice(items_.begin(), items_, it)` — relinks the node, no copy, no allocation, iterator stays valid
+- Evict order: read `items_.back().first` → `index_.erase(key)` → THEN `items_.pop_back()` (reverse order = use-after-free)
+- Key is stored inside the list node too, so eviction knows which map entry to erase
+- Capacity 0 throws `std::invalid_argument`
+- 8 tests incl. stress test: 200,000 random ops, capacity 16, 40 keys, seed 12345, vs O(n) vector brute force
+- Mutation check: removing `splice` in `Get` → 2 tests fail (stress test at op 81)
+
+**UNDERSTAND**
+- Why two structures: map gives O(1) find but no order; list gives O(1) move/remove but O(n) find.
+- Why a *doubly* linked list: removing a node from the middle needs its prev pointer.
+- Why `splice` beats erase + push_front: no free/malloc, and the iterator held by the map stays valid.
+- `Get` is a *write* to the structure (it reorders) → matters for threading.
+- **Why `std::list` is slow (pointer chasing):** every node is a separate heap
+  allocation at a random address. Walking/touching nodes means each step is a
+  likely cache miss (~100 ns to RAM vs ~1 ns L1). A vector's elements sit side by
+  side, so one 64-byte cache line brings several of them at once. Plus one
+  malloc/free per insert/evict.
+- **What a real buffer pool uses instead:** number of frames N is fixed at startup,
+  so keep `prev[N]`, `next[N]` integer arrays indexed by frame id (an "intrusive"
+  list with indices as pointers). No allocation ever, contiguous memory, 4–8 bytes
+  per link. Built in M3.
+
+**Complexity**
+- `Get`: O(1) average (hash lookup + splice)
+- `Put`: O(1) average (hash lookup/insert/erase + list ops)
+- Space: O(capacity). Per entry: a list node (2 pointers + pair + malloc header)
+  plus a hash node and bucket slot. Overhead per entry is several times the size
+  of a small int pair — exact bytes NOT MEASURED.
+
+**Interview questions**
+- Why map + list? → map finds in O(1), list keeps order with O(1) move. → *Follow-up:* why store the key in the node? To erase the evicted key from the map.
+- Why `splice`? → moves the node in O(1) without allocating; iterators stay valid. → *Follow-up:* what breaks if you used `erase` + `push_front`? The map's stored iterator dangles unless you update it; plus an extra free + malloc.
+- Write LRU live (LeetCode 146). → get: find → miss? / splice → return; put: exists? update+splice : (full? erase map(back.key), pop_back) → emplace_front, map[key]=begin.
+- Is it thread-safe? → No. Even `Get` mutates the list, so a reader-writer lock doesn't help; it needs an exclusive lock. → *Follow-up:* scale it? Shard by `hash(key) % S`, each shard its own lock + LRU (RocksDB's sharded LRU cache); or CLOCK, where a hit just sets a bit.
+- Weakness of LRU itself? → one big sequential scan pushes out all hot items ("sequential flooding"). → *Follow-up:* fix? LRU-2 / scan-resistant ring buffer (M13).
+
+**Scaling questions**
+- 1000x more entries? → memory overhead and malloc per insert dominate; pointer chasing means each touch is a cache miss. Fix: pre-allocated arrays with index links (M3), or CLOCK (one bit per slot).
+- Many threads? → one global lock, and every `Get` needs it exclusively → lock contention. Detect: throughput flat or falling as threads increase. Fixes, cheapest first: shard into S independent LRUs → CLOCK (hits only set a bit, almost no locking) → lock-free designs. What gets harder: no single global LRU order any more, only approximate LRU per shard.
+
+**Honest weaknesses + fixes**
+- Heap allocation per node + pointer chasing → index-based frame arrays (M3).
+- Not thread-safe → sharding or CLOCK.
+- Pure LRU is not scan-resistant → LRU-K / ring buffer (M13).
 
 ---
 
