@@ -47,6 +47,8 @@ child page id, unpins the current page and repeats until it reaches a leaf.
 | ASan + UBSan build | A watchman for memory bugs | We `memcpy` into raw 4KB buffers; catches overflow/use-after-free | Valgrind memcheck: slower (~20–50x) |
 | LRU = `std::list` + `unordered_map<key, list::iterator>` | Study table with 3 slots; return the book untouched longest | O(1) get/put; the classic interview version | Single `unordered_map` + timestamps: eviction becomes O(n) scan (or O(log n) with a heap/set) |
 | Stress test vs brute force | Same as CP: compare fast solution with obviously-correct slow one on random input | Catches ordering bugs hand tests miss (caught a missing `splice` at op 81) | Only hand-written tests: miss rare interleavings |
+| Replacer as array-based doubly linked list (`prev[N]`, `next[N]`) | Same LRU list, but stored in two fixed int arrays like a CP adjacency list | No malloc after startup, small cache-resident arrays, O(1) Pin/Unpin/Victim | `std::list`: malloc per node + pointer chasing; CLOCK: one bit per frame and cheaper hits, but Victim may scan many frames |
+| Replacer holds only unpinned frames | Only books nobody is reading go on the "send back" list | Victim never skips pinned frames → O(1) | Keep all frames and skip pinned ones: O(N) worst case per eviction |
 
 ---
 
@@ -171,6 +173,11 @@ move any book to the front instantly, once the map has told you where it is.
   list with indices as pointers). No allocation ever, contiguous memory, 4–8 bytes
   per link. Built in M3.
 
+**Mistakes I made in the checkpoint (don't repeat)**
+- A `Get` miss does NOT insert the key: it returns `nullopt` and the list is unchanged.
+  (In the buffer pool, the *caller* loads the page and inserts it.)
+- Vector is not slow at *reading*; it is slow at *moving a middle element to an end* (O(n) shift).
+
 **Complexity**
 - `Get`: O(1) average (hash lookup + splice)
 - `Put`: O(1) average (hash lookup/insert/erase + list ops)
@@ -193,6 +200,60 @@ move any book to the front instantly, once the map has told you where it is.
 - Heap allocation per node + pointer chasing → index-based frame arrays (M3).
 - Not thread-safe → sharding or CLOCK.
 - Pure LRU is not scan-resistant → LRU-K / ring buffer (M13).
+
+### Milestone 3: LRU Replacer (buffer-pool version)
+
+**What I built:** `LRUReplacer`, which tracks only the *unpinned* buffer-pool
+frames in LRU order and returns the least recently unpinned one in O(1). The
+list is stored in pre-allocated `prev_`/`next_` arrays indexed by frame id,
+with no heap allocation after construction.
+
+**Plain-language version (say this first)**
+Same study table, new rule: a book someone is reading (pinned) can't be sent
+back. So the "send back" list only contains books nobody is reading. When I
+need a seat, I take the oldest book from that list, with no checking needed.
+
+**MEMORISE**
+- Files: `include/index_engine/lru_replacer.h`, `src/lru_replacer.cpp`
+- `frame_id_t = int32_t`, `kInvalidFrameId = -1` (frame = RAM slot 0..N-1; page = disk block)
+- API: `Unpin(f)` → add as most recent (no-op if already present);
+  `Pin(f)` → remove (no-op if absent); `Victim()` → remove + return tail, `nullopt` if none; `Size()`
+- Storage: `std::vector<frame_id_t> prev_, next_` (sized once, never grow),
+  `std::vector<uint8_t> in_list_` (not `vector<bool>`: packed bitset), `head_` = most recent, `tail_` = victim
+- Design choice: Unpin of an already-evictable frame keeps its old position
+- No loops anywhere → every operation O(1)
+- 10 tests incl. stress test (64 frames, 200,000 random Pin/Unpin/Victim, seed 777, vs `std::list` linear-scan reference)
+- Mutation check: deleting `tail_ = p` in `Unlink` → 6 tests fail
+
+**UNDERSTAND**
+- Pin = "in use, must not be evicted"; pin count > 0. Replacer only sees pin count == 0 frames.
+- Why only unpinned frames in the list: Victim is the tail, never needs to skip pinned frames → O(1).
+- Unlink(f): `next[prev] = next`, `prev[next] = prev`, plus head/tail edge cases.
+- Why arrays beat `std::list`: no malloc/free, compact (N=1000 → 8 KB of links, fits in L1/L2),
+  4-byte indices vs 8-byte pointers. Honest caveat: `next[i]` can still jump anywhere in
+  the array, so the win is no allocation + tiny cache-resident arrays, not perfect sequential access.
+- `frame_id_t` and `page_id_t` are both plain `int32_t` aliases: compiler won't catch mixing them
+  (a strong-typedef struct would).
+
+**Complexity**
+- `Unpin`, `Pin`, `Victim`: O(1) worst case (not just average: no hashing)
+- Space: O(N) for N frames, ~9 bytes per frame (two int32 links + one byte flag), allocated once
+
+**Interview questions**
+- Why does the replacer hold only unpinned frames? → so Victim is O(1) and never returns a frame in use. → *Follow-up:* what if all frames are pinned? Victim returns `nullopt`; the buffer pool must fail fast (error), not loop/wait.
+- How is your LRU list stored? → `prev[]`/`next[]` int arrays indexed by frame id. → *Follow-up:* why not `std::list`? malloc per node + pointer chasing.
+- Why not CLOCK? → CLOCK makes hits cheaper (just set a bit, no relinking, good for concurrency) but eviction may sweep many frames; LRU here is exact and O(1). → *Follow-up:* what do real DBs use? PostgreSQL uses clock-sweep; InnoDB uses a modified LRU with a midpoint insertion (old/young sublists) to resist scans.
+- Why `vector<uint8_t>` not `vector<bool>`? → `vector<bool>` is a packed bitset specialization: bit masking on every access, no real `bool&`.
+- Unpin on an already-evictable frame? → design choice: no-op, keeps position.
+
+**Scaling questions**
+- 1000x more frames (e.g. 1M frames = 4 GB pool)? → arrays are ~9 MB, still fine; O(1) ops unchanged. The pool's page table (page→frame hash map, M4) grows more. Pure LRU's weakness under scans matters more with big scans (M13).
+- Many threads? → every Pin/Unpin modifies the shared list → one latch → contention on every page access. Fixes: partitioned pools (hash page id → sub-pool, each with own replacer + latch) → CLOCK (hits just set a reference bit) → lock-free variants. What gets harder: eviction becomes approximate / per partition.
+
+**Honest weaknesses + fixes**
+- Not thread-safe → latch per partition or CLOCK.
+- Exact LRU is not scan-resistant → LRU-K / scan ring buffer (M13).
+- Weak type safety between frame ids and page ids → strong typedef structs.
 
 ---
 
