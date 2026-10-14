@@ -49,6 +49,9 @@ child page id, unpins the current page and repeats until it reaches a leaf.
 | Stress test vs brute force | Same as CP: compare fast solution with obviously-correct slow one on random input | Catches ordering bugs hand tests miss (caught a missing `splice` at op 81) | Only hand-written tests: miss rare interleavings |
 | Replacer as array-based doubly linked list (`prev[N]`, `next[N]`) | Same LRU list, but stored in two fixed int arrays like a CP adjacency list | No malloc after startup, small cache-resident arrays, O(1) Pin/Unpin/Victim | `std::list`: malloc per node + pointer chasing; CLOCK: one bit per frame and cheaper hits, but Victim may scan many frames |
 | Replacer holds only unpinned frames | Only books nobody is reading go on the "send back" list | Victim never skips pinned frames → O(1) | Keep all frames and skip pinned ones: O(N) worst case per eviction |
+| Buffer pool with write-back | Reading room: N desks, a register, reader counts, "notes written" flag | Many changes to a page cost one disk write (at eviction/flush); hits cost zero I/O | Write-through (write to disk on every change): simpler, crash-safer, but one I/O per modification |
+| Fail fast when all frames pinned (`BufferPoolFullError`) | "No desk free", said immediately | Single-threaded: nobody else can ever unpin, so waiting = hang forever | Block and wait for an unpin: needed with many threads, but risks deadlock |
+| `mmap` instead of a buffer pool (not picked) | Let the OS manage the reading room | — | OS decides eviction and write-back order (can't guarantee WAL-before-data), I/O stalls appear as page faults, no pin control. See Crotty et al., "Are You Sure You Want to Use MMAP in Your DBMS?" (CIDR 2022) |
 
 ---
 
@@ -254,6 +257,78 @@ need a seat, I take the oldest book from that list, with no checking needed.
 - Not thread-safe → latch per partition or CLOCK.
 - Exact LRU is not scan-resistant → LRU-K / scan ring buffer (M13).
 - Weak type safety between frame ids and page ids → strong typedef structs.
+
+### Milestone 4: Buffer Pool Manager
+
+**What I built:** `BufferPoolManager`, which caches disk pages in a fixed
+number of 4KB frames. It tracks page id → frame in a page table, uses never-used frames
+first, then evicts the LRU unpinned frame (writing it back first if dirty),
+keeps pin counts and dirty flags, and throws `BufferPoolFullError` immediately
+when every frame is pinned.
+
+**Plain-language version (say this first)**
+Library reading room with N desks. A register says which book is on which desk.
+Each desk tracks how many people are reading (pin count) and whether someone
+wrote notes (dirty). Asked for a book: if it's on a desk, hand it over (hit, no
+basement trip). If not: take an empty desk, else clear the least-recently-used
+desk nobody is reading; if that book has notes, copy it back to the basement
+first. If every desk has readers, say "no desk" immediately.
+
+**MEMORISE**
+- Files: `include/index_engine/page.h`, `include/index_engine/buffer_pool_manager.h`, `src/buffer_pool_manager.cpp`
+- `Page`: `GetData()`, `GetPageId()`, `GetPinCount()`, `IsDirty()`; fields private, `friend class BufferPoolManager`
+- Members: `std::vector<char> memory_` (one slab, pool_size × 4096), `std::vector<Page> pages_`,
+  `unordered_map<page_id_t, frame_id_t> page_table_`, `vector<frame_id_t> free_list_` (stack), `LRUReplacer replacer_`
+- API: `FetchPage(pid)`, `NewPage(&pid)`, `UnpinPage(pid, is_dirty)`, `FlushPage(pid)`, `FlushAllPages()`, `DeletePage(pid)`, `Hits()`, `Misses()`
+- Frame choice: free list first → `replacer_.Victim()` → none → throw `BufferPoolFullError`
+- Dirty victim: `WritePage` BEFORE reuse; then erase old page from page table
+- Hit path: `pin_count++` AND `replacer_.Pin(f)` (remove from eviction candidates)
+- Unpin: `is_dirty_ = is_dirty_ || is_dirty` (OR, never assign); at pin 0 → `replacer_.Unpin(f)`
+- `NewPage`: get frame BEFORE `AllocatePage()` (no wasted page id on failure); zeroed; pinned; marked dirty
+- `DeletePage`: false if pinned; else remove from replacer + table, frame → free list (disk page id not reused)
+- Destructor: `FlushAllPages()` inside try/catch (destructors must not throw)
+- 14 tests; stress test: 200 pages, 8 frames, 50,000 random fetch/modify/unpin vs `std::map` of expected contents
+- Mutation checks: OR→assign on dirty caught (2 tests); no write-back of dirty victim caught (4 tests);
+  missing `replacer_.Pin` on hit was NOT caught at first → added `HitOnEvictablePageMakesItUnevictable`, now caught
+
+**UNDERSTAND**
+- Page vs frame: page = disk block (millions), frame = RAM slot (fixed N) holding one page.
+- Pin count = number of current users; > 0 → must not be evicted. Every Fetch/New needs exactly one Unpin;
+  a missed unpin = pin leak = frame stuck forever (RAII guard in M5 fixes this).
+- Dirty = modified in memory, disk copy is stale. Write-back happens only on eviction or flush.
+- Why OR the dirty flag: user A writes, user B only reads; B's clean unpin must not erase A's change.
+- Why fail fast: single thread → nobody else can unpin → waiting hangs forever.
+- Why hit path must call `replacer_.Pin`: an evictable page that gets fetched again is in use; if it stayed
+  in the replacer it could be evicted while someone holds a pointer to its frame (use-after-evict).
+- Why a stress test missed bug 2: it unpinned right after every fetch, so a page was never pinned during an
+  eviction. Random tests only cover the patterns they generate.
+- Why not mmap: the OS chooses eviction and write-back order (breaks WAL rules), stalls hide in page faults.
+
+**Complexity**
+- `FetchPage` hit: O(1) average (hash lookup + replacer Pin). Miss: O(1) + up to 2 disk I/Os (write-back of dirty victim + read)
+- `NewPage`: O(1) + possibly 1 write-back + memset 4KB
+- `UnpinPage`, `DeletePage`, `FlushPage`: O(1) average
+- `FlushAllPages`: O(pages in memory) + one write per dirty page
+- Space: pool_size × 4KB data + O(pool_size) metadata
+
+**Interview questions**
+- Walk me through FetchPage on a miss. → table miss → free frame or LRU victim → write back if dirty → erase old mapping → read page → pin=1 → add mapping. → *Follow-up:* what if all frames are pinned? Throw `BufferPoolFullError` (fail fast).
+- Why does Unpin OR the dirty flag? → so a later read-only user doesn't erase an earlier writer's change. → *Follow-up:* what happens if you assign? Lost update: change never written back.
+- What is a pin leak? → a Fetch without Unpin; frame can never be evicted; pool slowly fills → eventual BufferPoolFullError. → *Follow-up:* fix? RAII page guard that unpins in its destructor.
+- Why not just use mmap? → no control over eviction/write-back order, can't enforce WAL-before-data, I/O stalls as page faults, TLB shootdowns. → *Follow-up:* who uses mmap anyway? LMDB (read-mostly), early MongoDB (moved away).
+- Why does NewPage get the frame before allocating the page id? → so a full pool doesn't waste a page id.
+
+**Scaling questions**
+- 1000x data, same pool? → hit rate falls; misses cost disk reads (~100 µs SSD vs ~0.1 µs hit). Detect: `Misses()/(Hits()+Misses())`, `NumReads()`. Fixes: bigger pool → better replacement (LRU-K, M13) → prefetch for scans → more machines.
+- Many threads? → page table, free list, replacer all shared → one global latch, contended on every page access. Fixes: latch only the metadata, never hold it during disk I/O; partition the pool by `page_id % k`; per-page latches for page contents. What gets harder: two threads missing on the same page must not both load it ("in-flight" state), and waiting for a pinned frame needs a condition variable instead of fail-fast.
+- Huge pool (100 GB)? → page table rehash cost, `FlushAllPages` scan, and checkpointing take long; real DBs flush continuously in the background.
+
+**Honest weaknesses + fixes**
+- Not thread-safe → latches as above.
+- Destructor swallows flush errors → callers call `FlushAllPages()` explicitly before shutdown.
+- Write-back without a WAL: a crash loses every dirty page in memory → write-ahead log (scaling section).
+- `DeletePage` doesn't free the disk page id (no free list in DiskManager).
+- No `O_DIRECT`: a pool miss may still be served by the OS page cache (matters for "cold" benchmarks).
 
 ---
 
