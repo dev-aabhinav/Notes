@@ -52,6 +52,10 @@ child page id, unpins the current page and repeats until it reaches a leaf.
 | Buffer pool with write-back | Reading room: N desks, a register, reader counts, "notes written" flag | Many changes to a page cost one disk write (at eviction/flush); hits cost zero I/O | Write-through (write to disk on every change): simpler, crash-safer, but one I/O per modification |
 | Fail fast when all frames pinned (`BufferPoolFullError`) | "No desk free", said immediately | Single-threaded: nobody else can ever unpin, so waiting = hang forever | Block and wait for an unpin: needed with many threads, but risks deadlock |
 | `mmap` instead of a buffer pool (not picked) | Let the OS manage the reading room | — | OS decides eviction and write-back order (can't guarantee WAL-before-data), I/O stalls appear as page faults, no pin control. See Crotty et al., "Are You Sure You Want to Use MMAP in Your DBMS?" (CIDR 2022) |
+| RAII `PageGuard` (move-only) | Library card that signs you out automatically, whichever door you leave by | Unpin happens in the destructor → no pin leaks on early return or exception | Manual Unpin calls: easy to forget on one of many exit paths |
+| B+ tree (fanout 340) instead of a BST | A BST with ~300 children per node | 1M keys in ~3 levels = ~3 page reads, vs ~20 for a binary tree | Balanced BST / skip list: fine in RAM, terrible on disk (one page read per level) |
+| Separate `keys[]` and `values[]` arrays in a leaf (struct of arrays) | Keep the index cards in one drawer, the contents in another | Binary search touches only keys: 8 keys per 64-byte cache line instead of 4 pairs | Array of (key, value) pairs: simpler, worse locality during search |
+| `reinterpret_cast` raw page bytes to node structs | Read the page "as if" it were a struct | Zero-copy, same as BusTub; `static_assert` checks size + standard layout | `memcpy` in/out or C++23 `std::start_lifetime_as`: strictly standard-safe; costs copies / newer compiler |
 
 ---
 
@@ -329,6 +333,76 @@ first. If every desk has readers, say "no desk" immediately.
 - Write-back without a WAL: a crash loses every dirty page in memory → write-ahead log (scaling section).
 - `DeletePage` doesn't free the disk page id (no free list in DiskManager).
 - No `O_DIRECT`: a pool miss may still be served by the OS page cache (matters for "cold" benchmarks).
+
+### Milestone 5: PageGuard + B+ tree node layout + search
+
+**What I built:** a move-only RAII `PageGuard` that unpins in its destructor;
+the on-page layout of B+ tree leaf and internal nodes (each exactly 4096 bytes);
+a header page holding the root page id; and `BPlusTree::Find` / `Height`, which
+walk root → leaf with one binary search per node.
+
+**Plain-language version (say this first)**
+A B+ tree is a library catalogue in levels. Leaves hold sorted key→value cards
+and are chained left to right. Upper levels are signboards: "below 20 go left,
+20–40 middle, 40+ right". Each node is one 4KB page. A search reads one page per
+level, so the cost is the tree's height, which is about 3 for 1M keys because each
+node has hundreds of children instead of 2.
+
+**MEMORISE**
+- Files: `page_guard.h`, `b_plus_tree_page.h`, `b_plus_tree.h`, `src/b_plus_tree.cpp`
+- `KeyType = ValueType = int64_t`; unique keys
+- `NodeHeader` (16 B): `type` (kInvalid=0 / kLeaf=1 / kInternal=2), `size`, `next_leaf`, `reserved`
+- **Leaf capacity 255**: 16 + 255 × (8+8) = 4096. `keys[255]`, `values[255]` (separate arrays)
+- **Internal capacity 340 children**: 16 + 340 × 8 + 340 × 4 = 4096. `keys[0]` unused; `size` = number of children
+- Internal rule: `children[i]` holds keys in `[keys[i], keys[i+1])`; child for k = last i with `keys[i] <= k`
+  = `upper_bound(keys+1, keys+size, k) - keys - 1`. **Key equal to a separator goes RIGHT.**
+- Leaf lookup: `lower_bound` then check equality
+- `TreeHeaderPage { root_page_id }`: tree reopens from its header page id
+- `Find` cost = 1 header fetch + Height() node fetches (tested: 4 accesses for height 3)
+- During descent the child is pinned BEFORE the parent is unpinned (2 pins at once, the crabbing order)
+- `PageGuard`: copy deleted, move allowed; move-assign releases the old page first; `Release()` idempotent; `MarkDirty()`; `As<T>()`
+- Helpers: `FetchPageGuard(bpm, pid)`, `NewPageGuard(bpm, &pid)`
+- Tests: 7 guard + 10 tree/node tests; trees built bottom-up by a test helper (Insert comes in M6)
+- Mutation check: `upper_bound` → `lower_bound` in `ChildIndex` → 2 tests fail (key 20 = first separator becomes invisible)
+- Tree height at 1M keys: NOT MEASURED yet (expected ~3; measure after M6)
+
+**UNDERSTAND**
+- RAII: destructor runs on any scope exit, including exceptions → automatic unpin.
+- Why move-only: a copy = two unpins for one pin.
+- Why B+ tree over BST on disk: height log_340(n) vs log_2(n); each level is a page read.
+- Why values only in leaves (B+ vs B tree): internal nodes hold more keys → higher fanout → shorter tree; range scans walk the leaf chain.
+- Why separate key/value arrays: binary search reads only keys → fewer cache lines.
+- Why `kInvalid = 0`: a zeroed new page never looks like a valid node.
+- Strict aliasing caveat on `reinterpret_cast` (see table).
+
+**Complexity**
+- `Find`: O(h × log₂ F) comparisons, h = height ≈ log_F(n), F ≤ 340; O(h) page accesses (+1 header)
+- `Height`: O(h) page accesses
+- Space per node: exactly one 4KB page
+
+**Interview questions**
+- Why a B+ tree and not a red-black tree on disk? → fanout 340 vs 2: ~3 page reads vs ~20 for 1M keys. → *Follow-up:* what about in memory? Even in RAM, wide nodes are cache-friendlier (one node ≈ few cache lines per level).
+- How many keys fit in a leaf / children in an internal node, and why? → 255 / 340, from the 4096-byte math. → *Follow-up:* with 4-byte keys? Leaf (4096-16)/12 = 340, internal (4096-16)/8 = 510.
+- Which child do you follow for a key equal to a separator? → right; separator = smallest key of the right subtree. → *Follow-up:* what breaks if you go left? That key becomes unfindable (my mutation test showed it).
+- What is a pin leak and how does your code prevent it? → Fetch without Unpin; RAII `PageGuard` unpins in its destructor.
+- Is `reinterpret_cast` on page bytes legal C++? → strictly, strict-aliasing UB; common practice (BusTub); safe alternatives memcpy / `std::start_lifetime_as`.
+
+**Scaling questions**
+- 1M → 1B keys? → height grows by ~1 level (log_340 1B ≈ 3.6 → 4 levels). Top 2 levels (~1 + ~340 pages ≈ 1.4 MB) always stay hot in the pool; the cost of a lookup is mostly the leaf (and maybe the last internal level) miss → ~1–2 disk reads per lookup when leaves don't fit in RAM.
+- Many concurrent readers? → descent pins child before releasing parent = the order **latch crabbing** needs: take the child's read latch, then release the parent's. Readers can share read latches.
+- Bigger keys (strings)? → fixed-size slots don't work; need slotted pages (offset array + variable-length data) and prefix compression to keep fanout high.
+
+**Honest weaknesses + fixes**
+- Fixed 8-byte integer keys only → slotted pages for variable-length keys.
+- Unique keys only → duplicates need (key, rid) composite keys or overflow lists.
+- Header page fetched on every Find (one extra page access) → cache root id in memory (must stay in sync after root splits).
+- `reinterpret_cast` aliasing caveat.
+
+---
+
+## Repo housekeeping
+
+- 2026-11: a `claude/charming-johnson-4i1sk1` branch appeared on GitHub in project3 (created by the cloud session setup, same commit as main). All work is on `main`. Decide whether to delete it.
 
 ---
 
