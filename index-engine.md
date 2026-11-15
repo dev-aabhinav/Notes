@@ -56,6 +56,8 @@ child page id, unpins the current page and repeats until it reaches a leaf.
 | B+ tree (fanout 340) instead of a BST | A BST with ~300 children per node | 1M keys in ~3 levels = ~3 page reads, vs ~20 for a binary tree | Balanced BST / skip list: fine in RAM, terrible on disk (one page read per level) |
 | Separate `keys[]` and `values[]` arrays in a leaf (struct of arrays) | Keep the index cards in one drawer, the contents in another | Binary search touches only keys: 8 keys per 64-byte cache line instead of 4 pairs | Array of (key, value) pairs: simpler, worse locality during search |
 | `reinterpret_cast` raw page bytes to node structs | Read the page "as if" it were a struct | Zero-copy, same as BusTub; `static_assert` checks size + standard layout | `memcpy` in/out or C++23 `std::start_lifetime_as`: strictly standard-safe; costs copies / newer compiler |
+| Path stack instead of parent pointers | Remember the corridors you walked down, instead of every room storing "my parent is…" | After an internal split ~170 children move; parent pointers would need ~170 page writes | Parent pointers: easy upward walk, expensive splits/merges |
+| Split point: left gets ceil((n+1)/2) | Cut the folder roughly in half | Both halves ≥ half full → balanced occupancy | Ascending-insert optimisation (split 90/10 or "append" split, like InnoDB/Postgres fastpath): ~100% fill for sequential keys instead of 50% |
 
 ---
 
@@ -69,6 +71,12 @@ child page id, unpins the current page and repeats until it reaches a leaf.
 - **perf: hardware counters NOT available** (`dmesg`: "no PMU driver, software
   events only"). Cache-miss numbers must come from my laptop (real) or
   cachegrind (simulated, labelled as such).
+
+**Machine specs, second container (recorded 2026-11-15, used for M6 tree-shape run):**
+- `nproc`: 4; Intel Xeon @ 2.30GHz, KVM guest
+- Caches (as reported by the VM): L1d 192 KiB (4 instances), L2 8 MiB (4 instances), L3 504 MiB
+- RAM: 15 GiB
+- The container hardware CHANGES between sessions → always re-record specs next to timing numbers.
 
 ---
 
@@ -364,7 +372,7 @@ node has hundreds of children instead of 2.
 - Helpers: `FetchPageGuard(bpm, pid)`, `NewPageGuard(bpm, &pid)`
 - Tests: 7 guard + 10 tree/node tests; trees built bottom-up by a test helper (Insert comes in M6)
 - Mutation check: `upper_bound` → `lower_bound` in `ChildIndex` → 2 tests fail (key 20 = first separator becomes invisible)
-- Tree height at 1M keys: NOT MEASURED yet (expected ~3; measure after M6)
+- Tree height at 1M keys: **3** (measured in M6, both ascending and random)
 
 **UNDERSTAND**
 - RAII: destructor runs on any scope exit, including exceptions → automatic unpin.
@@ -398,6 +406,79 @@ node has hundreds of children instead of 2.
 - Header page fetched on every Find (one extra page access) → cache root id in memory (must stay in sync after root splits).
 - `reinterpret_cast` aliasing caveat.
 
+### Milestone 6: B+ tree Insert + split
+
+**What I built:** `BPlusTree::Insert` with leaf split (copy up), internal split
+(push up), recursive propagation to the parent via a path stack (no parent
+pointers), and new-root creation, the only way height grows. Node size limits
+are constructor parameters (default = page capacity 255 / 340) stored in the
+header page. `Stats()` walks the tree to measure its shape. A `TreeChecker` in
+the tests verifies every B+ tree invariant.
+
+**Plain-language version (say this first)**
+A leaf is a folder of at most 255 sorted cards. If there's room, slide the card in.
+If it's full, take a new folder, move the right half of the cards there, and tell
+the signboard above "cards from X onward are in the new folder". If the signboard
+is full, it splits too and tells its parent. If the top signboard splits, a new top
+is made. That's the only way the tree gets taller, so every leaf stays at the
+same depth and the tree is always balanced, with no rotations.
+
+**MEMORISE**
+- `Insert(key, value)` → `bool`; duplicate key → `false`, nothing changed
+- Descent pushes every internal page id onto `std::vector<page_id_t> path`; parent = `path.back()`
+- Room in leaf: `copy_backward` shift, insert at `LowerBound(key)`
+- Split: temp list of n+1 entries; **left gets (n+2)/2 = ceil((n+1)/2)**, right gets the rest; full leaf 255+1 → 128 + 128
+- **Leaf split = COPY UP**: separator = right leaf's first key; stays in the leaf
+- **Internal split = PUSH UP**: `push_up = tmp_keys[left_count]`; kept in neither half
+- New child goes at `ChildIndex(separator) + 1` in the parent
+- Leaf chain on split: `right.next = left.old_next`, then `left.next = right`
+- New page allocated BEFORE modifying the old node (a full pool can't leave a half-done leaf split)
+- Guards released before recursing upward: works with a 4-frame pool (tested)
+- `TreeHeaderPage { root_page_id, leaf_max_size, internal_max_size }`; limits validated: leaf ≥ 2, internal ≥ 3, ≤ page capacity
+- **Measured at 1M keys (tools/tree_shape, 2026-11-15):**
+  - ascending: **height 3**, 7,812 leaves, 46 internal pages, avg leaf fill **0.502** (128 keys/leaf), 30.7 MB
+  - random: **height 3**, 5,685 leaves, 30 internal pages, avg leaf fill **0.690** (175.9 keys/leaf), 22.3 MB
+  - at 200k random keys fill was 0.742 → fill varies with tree size
+- Warm-pool sizing fact for M9: the whole 1M-key tree is ≤ ~7,860 pages ≈ 31 MB
+- Tests: 10 insert tests incl. two exact whiteboard shapes, 20k random inserts with tiny nodes (height ≥ 6) vs `std::map`,
+  100k ascending/descending/random with real node sizes (height 3), tiny-pool test, reopen test
+- Mutation checks: broken leaf chain (caught only by the invariant checker, Find unaffected); wrong push-up key (4 tests);
+  child inserted at `pos` instead of `pos+1` (2 tests)
+
+**UNDERSTAND**
+- Copy up vs push up: leaves must contain every key → leaf separator is copied; internal keys are only signposts → moved.
+- Why the tree is always balanced: height only grows by splitting the root, which adds a level above every leaf at once.
+- Why a path stack: no parent pointers to maintain; splits move many children, and parent pointers would mean one write per moved child.
+- Why ascending inserts give ~50% fill: the left half of each split is never inserted into again.
+- Why the leaf-chain bug is invisible to Find: lookups go top-down; only range scans and the chain check notice.
+- Splits are NOT atomic across pages: a crash (or pool-full exception) between the leaf split and the parent update leaves
+  a right leaf with no separator in the parent → needs a WAL (scaling section).
+
+**Complexity**
+- Insert: O(h) page accesses down + O(h) in the worst case back up (split at every level); O(F) work per touched node for the shift / split copy (F ≤ 340)
+- Amortised splits per insert: O(1/F); most inserts touch only the leaf
+- Space: n / (fill × 255) leaf pages + ~1/F as many internal pages
+
+**Interview questions**
+- Draw a leaf split. → [10 20 30 40] + 50 → [10 20 30] [40 50], 40 copied up. → *Follow-up:* why copy and not move? Every key must stay in a leaf for lookups and range scans.
+- Draw an internal split. → children [c0 c1 c2 c3], keys [3 5 7] → [c0 c1 | 3], [c2 c3 | 7], 5 pushed up. → *Follow-up:* why isn't 5 kept? The parent now does its job; keeping it would duplicate a signpost.
+- How does the tree get taller? → only by a root split → new root with 2 children. → *Follow-up:* why does that keep it balanced? All leaves get one level deeper at once.
+- How do you find the parent during a split? → path stack recorded on the way down. → *Follow-up:* why not parent pointers? Updating them after a split costs one page write per moved child.
+- What happens if the process crashes mid-split? → leaf split done, parent not updated → keys in the new right leaf are unreachable (orphan page). → *Follow-up:* fix? WAL: log the whole split as one atomic operation, redo/undo on recovery (or shadow paging / copy-on-write like LMDB).
+- Sequential inserts fill leaves only 50%; fix? → "append" split when inserting at the right end (keep left full, start an almost-empty right) → ~100% fill, as Postgres/InnoDB do for monotonic keys.
+
+**Scaling questions**
+- 1B keys? → height 4 (log_~176 of 1B ≈ 4.0 for random fill). Splits remain rare (~1 per 128 inserts at the leaf level). The bottleneck is random leaf I/O when the leaf level doesn't fit in RAM; write-heavy workloads at that scale favour LSM trees (sequential writes).
+- Many writer threads? → latch crabbing for writers: take write latches top-down, release ancestors once the child is "safe" (won't split, i.e. not full). Optimistic variant: read-latch the path and write-latch only the leaf; restart pessimistically if a split is needed.
+- Monotonic keys (timestamps) from many threads? → every insert hits the rightmost leaf → hot-spot latch contention; fixes: hash/partition the key, or batch inserts.
+
+**Honest weaknesses + fixes**
+- Splits are not crash-atomic (no WAL).
+- 50% fill for ascending keys (no append-split optimisation).
+- `Insert` with an existing key returns false instead of updating (no upsert).
+- Recursion depth = height (fine: ≤ ~5).
+- `Stats()` reads every page: O(pages), not for hot paths.
+
 ---
 
 ## Repo housekeeping
@@ -412,6 +493,7 @@ All numbers: **NOT MEASURED** yet.
 
 | # | Benchmark | Result | Conditions |
 |---|---|---|---|
+| 0 | B+ tree shape at 1M keys (structural, no timing) | height 3; ascending 7,812 leaves / fill 0.502; random 5,685 leaves / fill 0.690 | `tools/tree_shape 1000000`, 2026-11-15, int64 keys, leaf max 255, internal max 340; deterministic (seeded shuffle) |
 | 1 | Range scan: B+ tree vs `std::map`, 1M keys, warm + cold | NOT MEASURED | |
 | 2 | Point lookup: extendible hash vs `std::unordered_map` (+ `std::map`) | NOT MEASURED | |
 | 3 | Cache misses (perf stat / cachegrind): B+ tree vs `std::map` | NOT MEASURED — locality claim is a **hypothesis** | |
