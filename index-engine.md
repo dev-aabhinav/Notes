@@ -60,6 +60,9 @@ child page id, unpins the current page and repeats until it reaches a leaf.
 | Split point: left gets ceil((n+1)/2) | Cut the folder roughly in half | Both halves ≥ half full → balanced occupancy | Ascending-insert optimisation (split 90/10 or "append" split, like InnoDB/Postgres fastpath): ~100% fill for sequential keys instead of 50% |
 | Delete with borrow-then-merge, min occupancy ceil(max/2) | A folder that gets too empty borrows a card from its neighbour, or the two folders are combined | Keeps every node ≥ half full → height stays O(log n), space stays bounded | "Lazy" delete without merging (many real systems, e.g. Postgres B-tree never merges non-empty pages; frees only empty ones): simpler, no rebalancing cascades, but space can stay wasted after mass deletes |
 | Range scan via leaf-chain iterator | Find the first page once, then read pages in order | One descent + sequential leaf walk; holds one pin | Repeated point lookups per key: one full descent per key |
+| Extendible hashing | Post office: mailbox chosen by the last few PIN digits; an overflowing box splits by looking at one more digit | Grows one bucket at a time: no full rehash (which on disk = rewrite the whole file) | Linear hashing: splits buckets in round-robin order, no directory, smoother growth, but needs overflow chains; static hashing + full rehash: long pauses |
+| Mixing hash (splitmix64 finalizer) instead of `std::hash` | Shuffle the digits so similar PINs don't land in the same box | libstdc++ `std::hash<int64>` is identity; patterned keys share low bits → directory explodes (measured: depth 13 vs 4) | Identity hash: fast, but terrible on patterned keys; cryptographic hash: unnecessary cost |
+| Multi-page directory (1024 ids/page) + cached meta page | The directory is a long list spread over several pages | Lets global depth reach 19 (≈133M keys); lookup = 2 page reads | Directory in one page: max depth 9 (512 buckets ≈ 130k keys) — too small for 1M; BusTub-style header→directories→buckets: bounds each directory to one page |
 
 ---
 
@@ -568,6 +571,86 @@ find the first folder once, then walk the folder chain left to right.
 - No reverse iteration (no `prev_leaf`).
 - Iterator is invalidated by concurrent modification (single-threaded design).
 - Not crash-atomic (no WAL), same as splits.
+
+### Milestone 8: Extendible hashing
+
+**What I built:** `ExtendibleHashTable`, a disk-backed hash index (int64 → int64,
+unique keys) on the same buffer pool: a meta page (global depth + directory page
+ids, cached in memory), directory pages (1024 bucket ids each), and bucket pages
+(255 unsorted entries). Insert splits a full bucket and doubles the directory
+when needed. Find/Remove read 1 directory page + 1 bucket page.
+
+**Plain-language version (say this first)**
+A post office: a parcel goes to the mailbox picked by the last few digits of its
+PIN (the hash). When a box overflows, only that box splits, and we look at one
+more digit to decide which parcels move. If the front-desk list can't tell
+those two boxes apart yet, the list doubles. No parcels move when it doubles; the
+new half just points at the same boxes. A normal hash table instead rebuilds
+everything when it grows, which on disk means rewriting the whole file.
+
+**MEMORISE**
+- Files: `hash_table_page.h`, `extendible_hash_table.h`, `src/extendible_hash_table.cpp`
+- Hash: `HashKey` = splitmix64 finalizer (shift-xor-multiply ×2); `IdentityHash` only for whiteboard tests
+- Directory index = `hash & (2^g − 1)` (low g bits)
+- Bucket page: `local_depth`, `size`, `keys[255]`, `values[255]` → 8 + 255×16 = 4088 B; unsorted, linear scan
+- Directory page: 1024 `page_id_t`; meta page: global depth, bucket size, up to 1020 directory page ids
+- **Max global depth 19** (2^19 entries = 512 dir pages; 2^20 would need 1024 > 1020) → ≈ 524k buckets × 255 ≈ 133M keys
+- **Split(bucket with local depth d):** if d == g → double first; new bucket; both get d+1;
+  keys with hash bit d = 1 move; directory entries with the same low d bits (spaced 2^d apart, 2^(g−d) of them) and bit d = 1 → new bucket
+- **Doubling:** copy entries [0, 2^g) → [2^g, 2^(g+1)); g += 1; no key moves. Within page 0 while < 1024 entries, then whole-page copies
+- Invariants: d ≤ g; keys in a bucket share low d bits; exactly 2^(g−d) entries point to each bucket
+- Insert loops: insert or split-and-retry; throws `HashTableFullError` at depth 19 (two keys equal on the low 20 bits can't be separated)
+- Remove: swap with last entry; **no bucket merge, no directory shrink**
+- Find/Remove = 2 page fetches (directory + bucket); meta page cached in memory
+- Same hash function must be used when reopening (not stored on disk)
+- **Measured:** 2,000 keys `k*1024`: identity hash → global depth **13** (8,192 entries); mixing hash → depth **4**
+- 11 tests incl. exact whiteboard (2 doublings + 1 split without doubling), 60k random inserts/removes vs `std::map`,
+  300k keys past one directory page, unsplittable-bucket throw, reopen, 5-frame pool
+- Mutation checks (by exit code): doubling without copy (6 tests); wrong redistribution bit (4); wrong directory
+  redirect (6); no doubling when d == g (crash)
+
+**Whiteboard example (identity hash, bucket size 2):**
+```
+insert 4 (100), 6 (110)   g=0  B0 [4 6]
+insert 5 (101): B0 full, d=0 == g=0 → DOUBLE (g=1), split on bit 0 → 0:B0 [4 6], 1:B1 [5]
+insert 0 (000): B0 full, d=1 == g=1 → DOUBLE (g=2), split on bit 1 → 00:B0 [4 0], 10:B2 [6]; 01 and 11 share B1 (d=1)
+insert 7 (111): 11 → B1 [5 7]
+insert 3 (011): B1 full, d=1 < g=2 → SPLIT WITHOUT DOUBLING on bit 1 → 01:B1 [5], 11:B3 [7 3]
+```
+
+**UNDERSTAND**
+- Local vs global depth: g = bits the directory looks at; d = bits a bucket's keys share. d < g → several entries share the bucket.
+- Why doubling moves no keys: the copied half points at the same buckets; only the following split moves keys.
+- Why a mixing hash matters: we index by low bits; identity hash on patterned keys puts everything in one bucket.
+- Why unsorted buckets: inserts are O(1) after the scan; 255 int64 keys are ~2 KB, a fast sequential scan.
+- Hash index can't do range scans (hash order ≠ key order) → that's what the B+ tree is for.
+
+**Complexity**
+- Find / Remove: O(1) page accesses (2), O(bucket size) scan
+- Insert: O(1) amortised; a split costs O(bucket size) + 2^(g−d−1) directory updates
+- Doubling: O(2^g) entry copies (≈ 2^g × 4 bytes) + 2^g/1024 new pages once g > 10
+- Space: directory 2^g × 4 B; buckets ≈ n / (fill × 255) pages
+
+**Interview questions**
+- Walk me through a bucket split. → see whiteboard. → *Follow-up:* when does the directory double? Only when the bucket's local depth equals the global depth.
+- What are global and local depth? → bits the directory uses vs bits the bucket's keys share. → *Follow-up:* how many directory entries point to a bucket? 2^(g−d).
+- Why extendible hashing on disk instead of a normal hash table? → no full rehash; each split rewrites 2 buckets + a few directory entries.
+- What's wrong with `std::hash<int64_t>`? → identity in libstdc++; low bits of patterned keys collide; I measured depth 13 vs 4.
+- What if many keys have the same hash low bits? → repeated splits/doublings; with duplicates of the SAME key (or full-hash collisions) splitting never helps → need overflow pages. → *Follow-up:* my build throws at depth 19.
+- Can you do range queries? → no; hash destroys key order. Use the B+ tree.
+
+**Scaling questions**
+- Directory doubling at large depth? → doubling from g=18 to 19 copies 2^18 entries (1 MB) and allocates 256 pages in one insert → a latency spike for that one insert. Fixes: amortise (copy lazily / incrementally), or bound the directory per page (BusTub: header → many small directories), or use linear hashing (no directory).
+- 1B keys? → beyond depth 19 (≈133M keys) in my build; need a 3-level structure or bigger directory; directory of 2^23 entries = 32 MB, must stay in memory for 2-read lookups.
+- Many threads? → directory latch (read for lookups, write for doubling) + per-bucket latches; doubling blocks everyone → partition into several independent tables by top hash bits.
+- Skewed keys (Zipfian)? → with unique keys and a good hash, key skew does NOT skew buckets (hash spreads them); skew hurts only with duplicate keys, a weak hash, or hot buckets under concurrency.
+
+**Honest weaknesses + fixes**
+- No bucket merge / directory shrink on delete → space stays after mass deletes.
+- Max depth 19 (≈133M keys) → multi-level directory.
+- No overflow pages: identical low-20-bit hashes throw.
+- Hash function not persisted → store a hash id in the meta page.
+- Directory updates during a split fetch a page per entry (fine at small 2^(g−d), wasteful when d ≪ g).
 
 ---
 
