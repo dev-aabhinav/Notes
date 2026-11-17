@@ -58,6 +58,8 @@ child page id, unpins the current page and repeats until it reaches a leaf.
 | `reinterpret_cast` raw page bytes to node structs | Read the page "as if" it were a struct | Zero-copy, same as BusTub; `static_assert` checks size + standard layout | `memcpy` in/out or C++23 `std::start_lifetime_as`: strictly standard-safe; costs copies / newer compiler |
 | Path stack instead of parent pointers | Remember the corridors you walked down, instead of every room storing "my parent is…" | After an internal split ~170 children move; parent pointers would need ~170 page writes | Parent pointers: easy upward walk, expensive splits/merges |
 | Split point: left gets ceil((n+1)/2) | Cut the folder roughly in half | Both halves ≥ half full → balanced occupancy | Ascending-insert optimisation (split 90/10 or "append" split, like InnoDB/Postgres fastpath): ~100% fill for sequential keys instead of 50% |
+| Delete with borrow-then-merge, min occupancy ceil(max/2) | A folder that gets too empty borrows a card from its neighbour, or the two folders are combined | Keeps every node ≥ half full → height stays O(log n), space stays bounded | "Lazy" delete without merging (many real systems, e.g. Postgres B-tree never merges non-empty pages; frees only empty ones): simpler, no rebalancing cascades, but space can stay wasted after mass deletes |
+| Range scan via leaf-chain iterator | Find the first page once, then read pages in order | One descent + sequential leaf walk; holds one pin | Repeated point lookups per key: one full descent per key |
 
 ---
 
@@ -454,6 +456,19 @@ same depth and the tree is always balanced, with no rotations.
 - Splits are NOT atomic across pages: a crash (or pool-full exception) between the leaf split and the parent update leaves
   a right leaf with no separator in the parent → needs a WAL (scaling section).
 
+**Whiteboard drill I did (leaf_max 3, internal_max 3, insert 10..80):**
+```
+insert 40:  [10 20 30]+40 → [10 20] [30 40], 30 copied up, new root (30)
+insert 60:  [30 40 50]+60 → [30 40] [50 60], 50 copied up → root (30 | 50)
+insert 70:  fits → [50 60 70]
+insert 80:  [50 60 70]+80 → [50 60] [70 80], 70 copied up → root would have 4 children
+            → internal split: children [10 20][30 40][50 60][70 80], keys 30 50 70
+            → (30) [10 20][30 40]  and  (70) [50 60][70 80], 50 PUSHED up → new root (50)
+final:                (50)
+               (30)          (70)
+          [10 20] [30 40] [50 60] [70 80]      height 3
+```
+
 **Complexity**
 - Insert: O(h) page accesses down + O(h) in the worst case back up (split at every level); O(F) work per touched node for the shift / split copy (F ≤ 340)
 - Amortised splits per insert: O(1/F); most inserts touch only the leaf
@@ -478,6 +493,81 @@ same depth and the tree is always balanced, with no rotations.
 - `Insert` with an existing key returns false instead of updating (no upsert).
 - Recursion depth = height (fine: ≤ ~5).
 - `Stats()` reads every page: O(pages), not for hot paths.
+
+### Milestone 7: B+ tree Delete (borrow / merge) + range scan iterator
+
+**What I built:** `BPlusTree::Remove` with leaf and internal borrow
+(redistribution) and merge, cascading upward, plus root collapse (height
+shrinks). `BPlusTreeIterator` with `Begin(lo)` / `Begin()` / `Next()` walks the
+leaf chain for range scans while holding one pin. Shared test helper
+`tests/tree_test_util.h` (`TreeChecker`).
+
+**Plain-language version (say this first)**
+Deleting is splitting in reverse. A folder must stay at least half full. If it
+gets too empty, borrow a card from the folder next to it, and fix the signboard.
+If the neighbour has nothing to spare, pour the two folders into one, throw the
+empty one away and remove its arrow from the signboard, which may now be too
+empty itself, so the fix ripples up. If the top signboard is left with one
+arrow, it's removed and the tree gets one level shorter. For a range scan:
+find the first folder once, then walk the folder chain left to right.
+
+**MEMORISE**
+- `bool Remove(KeyType key)`; missing key → `false`
+- Min occupancy: leaf ≥ `(leaf_max+1)/2` keys, internal ≥ `(internal_max+1)/2` children; root exempt
+  (real sizes: leaf ≥ 128, internal ≥ 170)
+- Path stores `PathEntry { page_id, child_index }`: siblings are `child_index ± 1`
+- Order of fixes: borrow from LEFT → borrow from RIGHT → MERGE (right node always poured into left; right page freed)
+- Leaf borrow: move one entry, then separator = first key of the right-hand leaf (`p->keys[i]` or `p->keys[i+1]`)
+- **Internal borrow = rotation through the parent**: parent separator comes DOWN, sibling's edge key goes UP, edge child moves over
+- Leaf merge: append right into left, `left.next = right.next`, remove right's key+child from parent
+- **Internal merge = PULL DOWN**: parent separator comes down between the two child lists (reverse of push-up)
+- Merge always fits: (min − 1) + min = 2·min − 1 ≤ max
+- `FixLeafUnderflow` / `FixInternalUnderflow` return true on merge → check the parent next
+- **Root collapse**: internal root with 1 child → child becomes root, old root freed → height − 1;
+  root leaf with 0 keys → tree empty
+- `FreePage` → `bpm.DeletePage`, throws `logic_error` if still pinned; disk page id is NOT reused
+- Iterator: `Begin(lo)` = descend once + `LowerBound(lo)`; `SkipToValid` hops `next_leaf`; one pin at a time; invalid at end
+- Range `[lo, hi)`: `for (auto it = tree.Begin(lo); it.Valid() && it.Key() < hi; it.Next())`
+- Max pins during delete: parent + node + sibling (3); tested with a 4-frame pool; full scan works with a 3-frame pool
+- 15 delete/scan tests incl. 5 exact whiteboard shapes; 44k mixed ops ×2 node configs vs `std::map` with full scan + delete-all;
+  100k real-size keys delete half then all; 300 random range queries (count + sum) vs `std::map`
+- Mutation checks (by exit code): no separator update after leaf borrow (5 tests); broken chain on merge (7 tests);
+  no pull-down on internal merge (crash); no root collapse (crash)
+- Lesson: count failures by EXIT CODE, not by grepping "FAILED" lines; a crash prints no summary.
+  Re-verified the M4 "uncaught bug" story by exit code: it holds (exit 0 without the added test).
+
+**UNDERSTAND**
+- Why borrow before merge: borrowing touches 3 pages and never cascades; merging frees a page but can ripple to the root.
+- Why separators change on leaf borrow: a separator must equal the smallest key of its right subtree.
+- Why internal borrow rotates: an internal key is a boundary between two children; moving a child across a boundary means the boundary itself moves through the parent.
+- Pull down vs push up: merge is exactly the inverse of split.
+- Root collapse is the only way height shrinks, mirror of root split → leaves always at equal depth.
+- Why the iterator is cheap for range scans: one descent (h pages), then one page per ~128–255 keys, read in order.
+
+**Complexity**
+- Remove: O(h) down + up to O(h) rebalances back up; O(F) shifting per touched node
+- Range scan of k keys: O(h + k / keys_per_leaf) page accesses
+- `Begin`: O(h)
+
+**Interview questions**
+- Draw a leaf merge. → [20] underfull, sibling [30 40] at min → [20 30 40], remove separator 30 and the right child from parent. → *Follow-up:* when do you borrow instead? When the sibling has more than the minimum.
+- What is an internal borrow? → rotation: parent separator down, sibling's edge key up, edge child moves. → *Follow-up:* why not just move a key? Children's boundaries would be wrong.
+- How does a B+ tree get shorter? → root with one child is removed; child becomes root.
+- Why must merged nodes fit? → underfull node has min−1, sibling exactly min, sum 2·min−1 ≤ max.
+- Do real databases merge? → many don't eagerly (Postgres B-tree only reclaims fully empty pages; InnoDB merges below a fill threshold, MERGE_THRESHOLD default 50%). Eager merging causes split/merge thrashing at the boundary. → *Follow-up:* fix for thrashing? Lower the merge threshold (e.g. merge below 25%) so a node isn't instantly split again.
+- How does your range scan work? → descend once to the first key ≥ lo, then follow `next_leaf`.
+
+**Scaling questions**
+- Range scan of 10% of 1B keys? → ~100M keys / ~176 per leaf ≈ 570k leaf pages ≈ 2.2 GB of sequential-ish reads; prefetching the next leaves (read-ahead) hides latency; leaves allocated in key order on disk make it truly sequential.
+- Mass deletes? → eager merges cost I/O on every delete; batch deletes or lazy reclamation (mark free, vacuum later) are cheaper.
+- Concurrent scan + writer? → iterator holds a leaf pin but no latch; with threads, a scan needs read latches leaf by leaf (latch the next before releasing the current), and must tolerate a split that moves keys to a new right leaf (the B-link tree idea: right-link pointers + high keys).
+
+**Honest weaknesses + fixes**
+- Freed pages are never reused on disk (no free list) → file never shrinks.
+- Eager merge at exactly half full → possible split/merge thrashing; use a lower merge threshold.
+- No reverse iteration (no `prev_leaf`).
+- Iterator is invalidated by concurrent modification (single-threaded design).
+- Not crash-atomic (no WAL), same as splits.
 
 ---
 
@@ -512,8 +602,8 @@ no WAL, goes through OS page cache.
 ## Resume lines (DRAFT — not yet backed by measurements)
 
 - Built a C++17 disk-backed storage engine: paged storage layer (4KB pages),
-  buffer pool with LRU replacement, B+ tree with split/merge. *(merge on delete
-  not built yet — M7)*
+  buffer pool with LRU replacement, B+ tree with split/merge (built and tested: insert splits,
+  delete borrow/merge, root split/collapse, leaf-chain range scans).
 - Extendible hashing with bucket splits and directory doubling; profiled growth
   under Zipfian key skew. *(NOT MEASURED)*
 - Benchmarks vs STL: *(all numbers NOT MEASURED; old "3.1x / 2.4x" claims removed
