@@ -652,6 +652,99 @@ insert 3 (011): B1 full, d=1 < g=2 → SPLIT WITHOUT DOUBLING on bit 1 → 01:B1
 - Hash function not persisted → store a hash id in the meta page.
 - Directory updates during a split fetch a page per entry (fine at small 2^(g−d), wasteful when d ≪ g).
 
+### Milestone 9: 📏 Range-scan benchmark — B+ tree vs `std::map`, warm vs cold
+
+**What I built:** `bench/bench_range_scan.cpp` + `DiskManager::DropOsCache()`
+(fsync + `posix_fadvise(DONTNEED)`). Raw results with specs:
+`project3/bench/results/range_scan_2026-11-18.md`.
+
+**Plain-language version (say this first)**
+std::map keeps every key in its own heap node, so a range scan hops from node to
+node across memory. My B+ tree keeps ~176 sorted keys per 4KB page, so a scan
+reads a page, walks 176 keys in a row, and moves to the next page. With
+everything already in the buffer pool (warm), the B+ tree was ~3x faster for
+10-key ranges and 24–46x faster for long ranges, compared with a std::map built
+in random order. When pages had to come from disk (cold), the B+ tree lost its
+lead and full scans were about as slow as the in-memory std::map.
+
+**Setup (MEMORISE)**
+- Machine: 4 vCPU Intel Xeon @ 2.10GHz (KVM), L1d 192 KiB, L2 8 MiB, L3 260 MiB (VM-reported), 15 GiB RAM; g++ 13.3, `-O3 -DNDEBUG`
+- Data: keys 0..999,999 inserted in seeded random order (seed 42), value = key; tree height 3, 5,700 leaves, 31 internal, fill 0.688
+- std::map built twice: random insertion order (main baseline) and ascending order (extra context)
+- Range sizes / queries per run: 10 / 10,000 · 1,000 / 1,000 · 100,000 / 10 · full 1M / 1
+- Start keys: pre-generated uniform random (seed 7), identical for every structure
+- **Timed:** only the scan loop (lower_bound/Begin + walk + sum values). **Excluded:** building, key generation
+- Each cell = **median of 5 runs**; spread printed; whole benchmark repeated in 3 separate processes
+- **Warm:** pool 16,384 frames (64 MB) > tree (~22 MB); warmed with a full scan + one untimed pass of the workload; **0 pool misses verified** in timed runs
+- **Cold pool, OS cached:** fresh empty pool each run, file still in OS page cache (pool misses = pread from RAM)
+- **Cold pool + OS dropped:** fresh pool + `DropOsCache()` each run; `mincore` confirmed **0.0%** of the file resident before each run
+- Checksums equal across all conditions
+
+**Results** (per query, medians; range = min–max over 3 process runs)
+
+| Range | std::map (random ins.) | std::map (asc. ins.) | B+ warm | B+ cold pool, OS cached | B+ cold pool + OS dropped | Warm speed-up vs map (random) | vs map (asc.) |
+|---|---|---|---|---|---|---|---|
+| 10 | 1.30–1.51 µs | 0.94–1.29 µs | 0.45–0.46 µs | 1.13–1.15 µs | 15.7–16.3 µs | **2.9–3.3x** | 2.1–2.8x |
+| 1,000 | 131–134 µs | 7.2–7.4 µs | 3.2–3.3 µs | 8.9–9.6 µs | 127–145 µs | **40–41x** | 2.2–2.3x |
+| 100,000 | 13.6–14.4 ms | 0.58–0.62 ms | 0.31–0.35 ms | 0.76–0.83 ms | 11.9–13.5 ms | **39–46x** | 1.7–2.0x |
+| 1,000,000 | 139–145 ms | 9.5–10.8 ms | 3.4–6.0 ms | 9.9–10.1 ms | 149–157 ms | **24–41x** | 1.6–3.0x |
+
+Per key on a full scan: map random ~140 ns, map ascending ~10 ns, B+ warm ~3.4–6 ns,
+B+ cold pool ~10 ns, B+ cold + OS dropped ~150 ns (5,702 device reads ≈ 26 µs per page).
+
+**What the numbers say**
+- Warm: the B+ tree wins every range size. For 10-key ranges the ~3x matches the old resume
+  claim; for long ranges it is far bigger against a randomly built map.
+- The baseline matters as much as the data structure: the SAME std::map is ~14x slower on long
+  scans when built in random order (nodes scattered in memory) than in ascending order.
+- Cold with the OS cache dropped: every leaf costs a device read (~26 µs in this VM); the B+ tree
+  falls to std::map (random) speed on full scans, and is ~10x slower than std::map on 10-key ranges.
+- Cold pool but OS cached: a pool miss costs ~1–2 µs (syscall + 4KB copy); still faster than
+  std::map (random) for ranges ≥ 1,000.
+
+**Why (hypothesis until M11 measures cache misses):** std::map iteration follows a pointer to
+a separately allocated node per key; in random allocation order consecutive keys are far apart in
+memory → likely a cache/TLB miss per key. B+ leaves hold keys contiguously → ~8 keys per cache line,
+hardware prefetch works. NOT yet proven: needs cache-miss counts (M11).
+
+**Methodology Q&A**
+- *How did you measure it?* `steady_clock` around the scan loop only; median of 5 runs per cell;
+  3 separate process runs; checksums equal; Release `-O3 -DNDEBUG` verified in the compile command.
+- *What was excluded?* Building the tree/map, generating start keys, file creation. Included: the
+  header-page fetch each B+ query does (`RootPageId`), the descent, the walk.
+- *What would change in production?* Real NVMe (~10–100 µs reads, more parallelism with async I/O);
+  bigger/variable keys → fewer keys per leaf; latches for concurrency add per-page cost; a map with a
+  pool/arena allocator would be much more compact; OS read-ahead or our own prefetch for cold scans.
+- *What was the bottleneck?* Warm: per-key iterator overhead + one page-table hash lookup per leaf
+  (and the 4-page descent for short ranges). Cold: device reads (one per leaf, synchronous, no prefetch).
+  std::map (random): memory latency per node (hypothesis, M11).
+
+**Caveats I must say out loud**
+- Spread is large in some cells (up to ±100%): the first 1–2 of 5 runs are often slower (likely cache/TLB
+  disturbance from the previous condition or VM noise; not investigated further). The median is stable
+  across process runs except the warm full scan (3.4–6.0 ms).
+- "Cold" in a VM: the guest page cache was dropped (0.0% resident), but the host may still cache the
+  virtual disk, so ~26 µs per read may be faster than real cold storage.
+- Cold runs use a pool bigger than the tree, so each page is read at most once per run ("first-touch cold");
+  short-range batches re-use pages loaded earlier in the same run.
+- Single-threaded, synchronous reads, no prefetching.
+
+**Interview questions (benchmark)**
+- Is "3x faster" true? → Only warm and only for short ranges vs a randomly built map; long ranges 24–46x;
+  vs an ascending-built map 1.6–3x; cold, on par or slower. → *Follow-up:* why did you build the map two ways?
+  Because insertion order changes the map's memory layout, and I wanted to separate structure from allocation effects.
+- How do you know warm had no disk I/O? → I counted pool misses during timed runs: 0. My first version had 29
+  misses because the warm-up only loaded the leftmost path; I caught and fixed it.
+- How do you know cold really hit the device? → `posix_fadvise(DONTNEED)` + `mincore` showed 0.0% resident;
+  DiskManager counted 5,702 reads per full scan. Caveat: VM host cache.
+- Why median, not mean? → robust to the slow first runs and VM hiccups; I also report spread and raw runs.
+
+**Scaling questions**
+- 1B keys, warm? → tree ~22 GB ≫ RAM; "warm" is impossible; steady state = top levels cached, leaves cold →
+  scans cost ~1 device read per ~176 keys; prefetch / large sequential reads become essential.
+- Cold scans faster? → read-ahead of next leaves (async I/O, io_uring), allocate leaves in key order so a scan is
+  sequential on disk, larger pages (16 KB) to cut I/O count.
+
 ---
 
 ## Repo housekeeping
@@ -667,9 +760,9 @@ All numbers: **NOT MEASURED** yet.
 | # | Benchmark | Result | Conditions |
 |---|---|---|---|
 | 0 | B+ tree shape at 1M keys (structural, no timing) | height 3; ascending 7,812 leaves / fill 0.502; random 5,685 leaves / fill 0.690 | `tools/tree_shape 1000000`, 2026-11-15, int64 keys, leaf max 255, internal max 340; deterministic (seeded shuffle) |
-| 1 | Range scan: B+ tree vs `std::map`, 1M keys, warm + cold | NOT MEASURED | |
+| 1 | Range scan: B+ tree vs `std::map`, 1M keys, warm + cold | Warm: 2.9–3.3x faster (10-key ranges), 24–46x (≥1K-key ranges) vs map built in random order; 1.6–3.0x vs map built in ascending order. Cold pool + OS cache dropped: full scan 149–157 ms ≈ map (random) 139–145 ms; 10-key range 15.7–16.3 µs vs map 1.3–1.5 µs | 2026-11-18, 4 vCPU Xeon 2.10GHz KVM, -O3; 1M int64 keys, random insert order; median of 5 runs × 3 processes; only scan loop timed; warm = 0 misses verified; cold = empty pool + fadvise DONTNEED (0.0% resident). See M9 |
 | 2 | Point lookup: extendible hash vs `std::unordered_map` (+ `std::map`) | NOT MEASURED | |
-| 3 | Cache misses (perf stat / cachegrind): B+ tree vs `std::map` | NOT MEASURED — locality claim is a **hypothesis** | |
+| 3 | Cache misses (perf stat / cachegrind): B+ tree vs `std::map` | NOT MEASURED — locality explanation for M9 results is a **hypothesis** | |
 | 4 | Extendible hash growth under Zipfian skew | NOT MEASURED | |
 | 5 | Sequential flooding: LRU vs fix, hit rate + p99 | NOT MEASURED | |
 
@@ -689,5 +782,8 @@ no WAL, goes through OS page cache.
   delete borrow/merge, root split/collapse, leaf-chain range scans).
 - Extendible hashing with bucket splits and directory doubling; profiled growth
   under Zipfian key skew. *(NOT MEASURED)*
-- Benchmarks vs STL: *(all numbers NOT MEASURED; old "3.1x / 2.4x" claims removed
-  until measured)*
+- Range scans (MEASURED, M9), draft wording: "Benchmarked vs std::map on 1M keys: with a warm buffer
+  pool, B+ tree range scans ran ~3x faster on 10-key ranges and 24–46x faster on ≥1K-key ranges
+  (vs a randomly-built map; 1.6–3x vs an ascending-built one); with a cold pool, full scans were on par."
+  (Final wording in M14; locality explanation still a hypothesis until M11.)
+- Hash lookups vs std::unordered_map: NOT MEASURED (M10); old "2.4x" claim removed.
