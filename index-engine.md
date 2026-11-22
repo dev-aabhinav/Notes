@@ -739,6 +739,10 @@ hardware prefetch works. NOT yet proven: needs cache-miss counts (M11).
   DiskManager counted 5,702 reads per full scan. Caveat: VM host cache.
 - Why median, not mean? → robust to the slow first runs and VM hiccups; I also report spread and raw runs.
 
+**Re-check after the M13 Replacer refactor (one run, 2026-11-22):** B+ warm 10-key 0.52 µs (2.7x vs map random),
+1K 4.07 µs (34x), 100K 429 µs (34x), full 4.0 ms (37x) — slightly slower than before (virtual call + noise, spreads
+±49–77%); short-range claim widened to **2.7–3.3x**. Lookups unchanged (hash 281 ns, B+ 471 ns).
+
 **Scaling questions**
 - 1B keys, warm? → tree ~22 GB ≫ RAM; "warm" is impossible; steady state = top levels cached, leaves cold →
   scans cost ~1 device read per ~176 keys; prefetch / large sequential reads become essential.
@@ -1125,24 +1129,94 @@ All numbers: **NOT MEASURED** yet.
 
 ## Scaling section
 
-*(Filled in fully at M14.)* Current design: single-threaded, single file,
-no WAL, goes through OS page cache.
+**Current design limits (say these before the interviewer does):** single-threaded; one file; no WAL (not
+crash-safe); synchronous I/O, one read at a time; goes through the OS page cache; fixed int64 keys/values; no
+free-page list (file never shrinks); extendible hash max depth 19 (≈133M keys); replacement policy CPU cost (LRU-2).
 
----
+**Data growth (B+ tree, random insert order)**
 
-## Resume lines (DRAFT — not yet backed by measurements)
+| Keys | Height | Size | Source | What runs out first |
+|---|---|---|---|---|
+| 1M | 3 | 22 MB | measured (M6) | nothing: fits in a 64 MB pool |
+| 10M | 3 (ascending: 4) | 222 MB (ascending 307 MB) | measured (`tree_shape 10000000`) | pool unless ≥ 256 MB |
+| 100M | ~4 | ~2.2 GB | estimate: 10x leaves, root overflows | RAM for leaves → leaf reads go to disk |
+| 1B | ~4 | ~22 GB | estimate | RAM: only upper levels cached (~1 + 250 + 60k pages); each lookup ≈ 1 device read; scans = sequential leaf reads |
 
-- Built a C++17 disk-backed storage engine: paged storage layer (4KB pages),
-  buffer pool with LRU replacement, B+ tree with split/merge (built and tested: insert splits,
-  delete borrow/merge, root split/collapse, leaf-chain range scans).
-- Extendible hashing with bucket splits and directory doubling; profiled growth under Zipfian key skew
-  (MEASURED, M12): "skew (θ 0.99/1.2) left directory growth unchanged per distinct key — doublings at the
-  same key counts as uniform; measured doubling cost rising to 78 µs at depth 17 (vs 0.9 µs median insert)." 
-- Range scans (MEASURED, M9), draft wording: "Benchmarked vs std::map on 1M keys: with a warm buffer
-  pool, B+ tree range scans ran ~3x faster on 10-key ranges and 24–46x faster on ≥1K-key ranges
-  (vs a randomly-built map; 1.6–3x vs an ascending-built one); with a cold pool, full scans were on par."
-  (Final wording in M14; locality explanation still a hypothesis until M11.)
-- Hash lookups (MEASURED, M10): old "2.4x faster" claim is FALSE vs unordered_map (5.2–5.5x slower warm).
-  Draft wording: "Built a disk-backed extendible hash index (splits + directory doubling); warm lookups
-  ~0.3 µs, 4–5x faster than std::map and ~1.7x faster than the B+ tree, ~5x slower than in-memory
-  std::unordered_map; profiled the cost to buffer-pool page accesses, not bucket scans." 
+- 1M → 1B: height grows only by ~1 (fanout ~235 at 69% fill). The real change is the hit rate: leaves no longer fit,
+  so cold reads dominate. Fixes in cost order: bigger pool → prefetch/read-ahead for scans → async I/O → bigger pages
+  (16 KB) → partitioning across machines.
+
+**Data bigger than one disk / machine — partitioning**
+- **Range partitioning** (Bigtable/Spanner tablets, HBase regions): each shard owns a key range → range scans touch
+  one or a few shards (fits a B+ tree). Risk: hot spots (monotonic keys all hit the last range). Rebalancing:
+  split a hot/large range and move half.
+- **Hash partitioning** (Dynamo, Cassandra): even load, but a range scan must ask every shard. Use consistent hashing
+  so adding a node moves only ~1/N of the keys.
+- Rebalancing either way: move ranges/virtual nodes in the background, keep serving reads (copy, then switch ownership).
+
+**Many concurrent threads**
+- B+ tree: **latch crabbing** — readers latch the child, then release the parent (my descent already pins in that
+  order); writers release ancestors once the child is "safe" (won't split/merge). Optimistic variant: read-latch
+  the path, write-latch only the leaf, restart if a split is needed. B-link trees add right-sibling links + high keys.
+- Buffer pool: one global latch over page table + replacer is hit 2–4 times per lookup → first contention point.
+  Fixes: partition the pool (`page_id % k`, each with its own latch and replacer); never hold the latch during I/O;
+  CLOCK (a hit just sets a bit); per-page latches for page contents.
+- Extendible hash: directory read latch for lookups; doubling needs it exclusively (78 µs at depth 17, measured) →
+  partition into several tables by top hash bits.
+
+**Crash safety**
+- Today: dirty pages are written back lazily → a crash loses all dirty pages; a crash mid-split leaves a new leaf
+  with no separator in the parent (unreachable keys); a power loss can tear a 4 KB write.
+- Production: **write-ahead log** — log every change before the data page (WAL rule), fsync the log at commit,
+  replay on recovery (ARIES: redo then undo), periodic checkpoints to bound replay. A split is logged as one atomic
+  multi-page action. Torn pages: page checksums + full-page images (Postgres) or a doublewrite buffer (InnoDB).
+  Alternative: copy-on-write/shadow paging (LMDB) — never overwrite, switch the root atomically.
+
+**Extendible hashing directory doubling at large depth**
+- Measured (M12): 10 µs at depth 13 → 78 µs at depth 17, roughly doubling per level; ~300 µs at depth 19 (extrapolated).
+- Fixes: copy the directory incrementally, bound directories per page (header → directories → buckets, BusTub style),
+  or linear hashing (no directory, splits one bucket at a time in round-robin order).
+
+**Read-heavy vs write-heavy: B+ tree vs LSM tree**
+- B+ tree (this project): reads ≈ height page reads (≈ 1 disk read with cached upper levels), range scans walk leaves.
+  Writes update pages in place → random I/O, and a 16-byte change rewrites a 4 KB page (write amplification).
+  Best for read-heavy and mixed OLTP (InnoDB, Postgres).
+- LSM tree (RocksDB, Cassandra, LevelDB): writes go to an in-memory memtable + WAL and are flushed as sorted files
+  sequentially → very high write throughput. Reads may check several levels (bloom filters skip most); background
+  compaction costs I/O and CPU (write amplification) and space before old versions are dropped.
+- Rule of thumb: read-heavy / range-heavy → B+ tree; write-heavy / ingest → LSM. (RUM trade-off: read, update and
+  memory overhead can't all be minimised at once.)
+
+**What a production engine adds:** WAL + recovery; concurrency control (latches for structures, locks or MVCC for
+transactions); slotted pages for variable-length keys; prefix compression; free-space management; async I/O;
+replication and partitioning; monitoring of hit rate and latency percentiles.
+
+## Resume lines (FINAL — every number measured; see Benchmarks table and M6–M13)
+
+- Built a disk-backed storage engine in C++17 (~2.6k lines + ~2.9k lines of GoogleTest, 103 tests incl.
+  brute-force stress and mutation checks): 4 KB paged storage, buffer pool with pin counts, dirty write-back
+  and O(1) LRU replacement, and a B+ tree with splits, merges and range scans (height 3 at 1M and 10M keys).
+- Benchmarked against std::map on 1M keys: with a warm buffer pool, B+ tree range scans were 2.7–3.3x faster
+  on 10-key ranges and 24–46x faster on ≥1K-key ranges (vs a randomly built map; 1.6–3x vs an ascending-built
+  one); with a cold pool they were on par. Simulated cache counts showed ~7x fewer misses per key.
+- Implemented extendible hashing (bucket splits, directory doubling) and profiled it: ~0.3 µs warm lookups,
+  4–5x faster than std::map but ~5x slower than std::unordered_map, a gap traced to buffer-pool page
+  accesses; Zipfian skew left growth per distinct key unchanged.
+- Reproduced sequential flooding under LRU (+9–11 points of disk lookups during a full scan) and removed it
+  with LRU-2 (flat), at ~1.5 µs extra CPU per lookup.
+
+**Claims I must NOT make:** "3.1x faster range scans" without "warm" and the range size; "2.4x faster lookups"
+(false vs unordered_map); "cache locality proven on hardware" (only simulated; perf run pending); "crash-safe";
+"concurrent"; "production-ready".
+
+**Pending:** real `perf stat` counters on a native Linux laptop (M11). Until then, say "simulated" for misses.
+
+**Honest weaknesses (and the fix I'd name)**
+1. No WAL → not crash-safe; mid-split crash leaves unreachable keys → WAL + atomic split logging.
+2. Single-threaded → latch crabbing, partitioned buffer pool.
+3. Synchronous I/O, no prefetch → cold scans pay one device read per leaf → read-ahead / io_uring.
+4. Fixed int64 keys → slotted pages.
+5. No free-page list, deleted pages never reused → free list in a header page.
+6. LRU-2 uses std::set (O(log n) + malloc per access) → 2Q or CLOCK.
+7. Extendible hash: no merge/shrink, max depth 19, directory accessed through the pool → in-memory directory.
+8. Benchmarks in a VM: host may cache the "cold" disk; spreads up to ±100% in some cells (medians reproducible).
