@@ -745,6 +745,99 @@ hardware prefetch works. NOT yet proven: needs cache-miss counts (M11).
 - Cold scans faster? → read-ahead of next leaves (async I/O, io_uring), allocate leaves in key order so a scan is
   sequential on disk, larger pages (16 KB) to cut I/O count.
 
+### Milestone 10: 📏 Lookup benchmark — extendible hash vs `std::unordered_map`
+
+**What I built:** `bench/bench_lookup.cpp` (+ shared `bench/bench_util.h`). Raw results with specs:
+`project3/bench/results/lookup_2026-11-22.md`.
+
+**Plain-language version (say this first)**
+My disk-backed hash table is about 5x SLOWER than std::unordered_map, even when every
+page is already in memory. Each lookup goes through the buffer pool twice (directory
+page + bucket page), and each trip costs ~135–160 ns. unordered_map just follows one or
+two pointers in RAM. It is ~4–5x faster than std::map and ~1.5–1.9x faster than my own
+B+ tree, because it touches 2 pages instead of 4. The old "2.4x faster lookups" claim is
+false against the right baseline, so I dropped it.
+
+**Setup (MEMORISE)**
+- Machine: 4 vCPU Intel Xeon @ 2.10GHz (KVM), L2 8 MiB, 15 GiB; g++ 13.3 `-O3 -DNDEBUG`
+- Data: 1M **even** keys 0..1,999,998, random insert order (seed 42), value = key
+- Hits: 1M random even keys; misses: 1M random **odd** keys (fall between stored keys; first design
+  used keys ≥ N, which made ordered structures always walk the same hot rightmost path → fixed)
+- Baselines: `unordered_map` with `std::hash` (identity in libstdc++), `unordered_map` with the same
+  splitmix64 mixing hash (**main baseline**), `std::map` and my B+ tree as context
+- Hash table shape at 1M: global depth 13, 8,192 directory entries (8 pages), 5,014 buckets,
+  fill 0.782 (199 keys/bucket); unordered_map: 1.45M buckets, load factor 0.69
+- Timed: only the lookup loop. Warm: 1M lookups/run, pool larger than the table, 0 misses verified.
+  Cold: 10k lookups/run, empty pool each run (opening the table is inside the timed region),
+  with OS cache kept or dropped (mincore 0.0% resident)
+- Median of 5 runs per cell; 4 separate process runs; checksums all match
+
+**Results** (per lookup, median; range over 4 process runs)
+
+| Structure | Warm hit | Warm miss | Cold pool, OS cached | Cold pool + OS dropped |
+|---|---|---|---|---|
+| unordered_map, std::hash (identity) | 26–30 ns | 28–35 ns | — | — |
+| **unordered_map, mixing hash** | **52–62 ns** | 64–76 ns | — | — |
+| std::map | 1,319–1,450 ns | 1,280–1,374 ns | — | — |
+| **extendible hash** | **271–324 ns** | 361–373 ns | 719–868 ns (4,235 reads / 10k lookups) | 13.8–15.5 µs |
+| B+ tree | 493–518 ns | 474–499 ns | 919–1,338 ns (4,698 reads / 10k) | 13.3–18.5 µs |
+
+- Extendible hash vs unordered_map (mixing hash): **5.2–5.5x SLOWER** (warm hits)
+- vs unordered_map (std::hash): 9.3–12.4x slower — identity hash on dense keys is a best case
+- vs std::map: 4.1–4.9x faster · vs my B+ tree: 1.5–1.9x faster
+- Cold + OS dropped: hash ≈ B+ tree (~14–18 µs): both pay ~1 device read per lookup; the difference
+  in page accesses stops mattering once one read costs ~20 µs
+
+**Bottleneck — measured, not guessed (bucket-size sweep, all rows 0 misses):**
+bucket size 255 → 322 ns · 128 → 338 · 64 → 359 · 32 → 372 · 16 → 431 ns.
+Cutting the in-bucket scan ~18x did NOT help → the scan is not the bottleneck. The cost is per
+buffer-pool page access: hash = 2 accesses ≈ 135–160 ns each; B+ tree = 4 accesses (header + 3 levels)
+≈ 125 ns each. Which part of a page access costs most (page-table hash lookup, replacer pin/unpin,
+cache miss on the 4KB page) is still a hypothesis → M11.
+(First sweep attempt was invalid: small buckets → more pages than the 16,384-frame pool → millions of
+misses; caught by the 0-misses check; fixed by sizing the pool from the real page count.)
+
+**Methodology Q&A**
+- *How did you measure it?* steady_clock around the lookup loop only; median of 5; 4 process runs;
+  checksums equal; 0 pool misses verified for every warm row.
+- *What was excluded?* Building all structures, generating keys. Included: hashing, directory + bucket
+  fetch through the buffer pool, pin/unpin, bucket scan. Cold rows include opening the table.
+- *What would change in production?* Concurrency latches add per-page cost; caching the directory in
+  memory (not as a buffer-pool page) would cut one page access → ~half the cost; real NVMe latency;
+  variable-length keys need slotted buckets; data much larger than RAM is where a disk hash table
+  is actually needed — unordered_map can't do that at all.
+- *What was the bottleneck?* Warm: buffer-pool page accesses (2 per lookup), proven by the sweep.
+  Cold: one device read per lookup (~14 µs incl. overhead in this VM).
+
+**Why "2.4x faster lookups" was wrong:** it was likely measured against std::map (here the hash is
+4.1–4.9x faster than std::map). Against the correct baseline, std::unordered_map, it is ~5x slower.
+The fair claim: a disk-backed hash index that survives restarts and data bigger than RAM, at the cost
+of ~5x latency vs an in-memory hash map when warm.
+
+**Interview questions**
+- Why is your hash table slower than unordered_map? → 2 buffer-pool page accesses per lookup
+  (~135–160 ns each: page-table hash lookup, pin/unpin, touching a 4KB page); unordered_map ~2 cache lines.
+  → *Follow-up:* how do you know it isn't the bucket scan? Shrinking buckets 18x didn't speed it up.
+- Then why build it? → persistence, data larger than RAM, no full rehash on growth. In RAM, use unordered_map.
+- Why two unordered_map baselines? → libstdc++ std::hash is identity; dense integer keys become a
+  best case (26–30 ns). The mixing-hash version is the fair comparison.
+- Why odd keys for misses? → keys ≥ N always hit the rightmost path of ordered structures, which stays
+  cached and looks unrealistically fast (std::map "miss" was 11 ns in my first version).
+- How would you make it faster? → keep the directory in memory (not a pooled page): 1 page access;
+  pointer swizzling / skip the page-table lookup for hot pages; sorted buckets or SIMD scan (minor —
+  the sweep shows the scan isn't the bottleneck).
+
+**Scaling questions**
+- 1B keys? → hash table ≈ 5.1M buckets ≈ 20 GB: can't be warm; each lookup ≈ 1 device read (bucket)
+  as long as the directory (32 MB at depth 23) stays cached — that's the case where a disk hash index
+  beats a B+ tree (1 read vs ~1–2 reads, both with cached upper levels).
+- Many threads? → the buffer pool's page table + replacer latch is hit twice per lookup → the first
+  contention point; partitioned pool and a read-mostly directory help.
+
+**Honest weaknesses**
+- Every directory access goes through the buffer pool (an extra page access per lookup).
+- Single-threaded, synchronous I/O; VM cold numbers may be optimistic (host cache).
+
 ---
 
 ## Repo housekeeping
@@ -761,7 +854,7 @@ All numbers: **NOT MEASURED** yet.
 |---|---|---|---|
 | 0 | B+ tree shape at 1M keys (structural, no timing) | height 3; ascending 7,812 leaves / fill 0.502; random 5,685 leaves / fill 0.690 | `tools/tree_shape 1000000`, 2026-11-15, int64 keys, leaf max 255, internal max 340; deterministic (seeded shuffle) |
 | 1 | Range scan: B+ tree vs `std::map`, 1M keys, warm + cold | Warm: 2.9–3.3x faster (10-key ranges), 24–46x (≥1K-key ranges) vs map built in random order; 1.6–3.0x vs map built in ascending order. Cold pool + OS cache dropped: full scan 149–157 ms ≈ map (random) 139–145 ms; 10-key range 15.7–16.3 µs vs map 1.3–1.5 µs | 2026-11-18, 4 vCPU Xeon 2.10GHz KVM, -O3; 1M int64 keys, random insert order; median of 5 runs × 3 processes; only scan loop timed; warm = 0 misses verified; cold = empty pool + fadvise DONTNEED (0.0% resident). See M9 |
-| 2 | Point lookup: extendible hash vs `std::unordered_map` (+ `std::map`) | NOT MEASURED | |
+| 2 | Point lookup: extendible hash vs `std::unordered_map` (+ `std::map`) | Warm hit: ext hash 271–324 ns vs unordered_map (mixing hash) 52–62 ns → **5.2–5.5x slower**; vs std::map 1.3–1.45 µs → 4.1–4.9x faster; vs B+ tree 493–518 ns → 1.5–1.9x faster. Cold + OS dropped: 13.8–15.5 µs (≈ B+ tree). Bottleneck = buffer-pool page accesses (bucket-size sweep) | 2026-11-22, 4 vCPU Xeon 2.10GHz KVM, -O3; 1M even int64 keys, random insert order; 1M random hit lookups/run warm, 10k cold; median of 5 × 4 processes; 0 misses verified warm; see M10 |
 | 3 | Cache misses (perf stat / cachegrind): B+ tree vs `std::map` | NOT MEASURED — locality explanation for M9 results is a **hypothesis** | |
 | 4 | Extendible hash growth under Zipfian skew | NOT MEASURED | |
 | 5 | Sequential flooding: LRU vs fix, hit rate + p99 | NOT MEASURED | |
@@ -786,4 +879,7 @@ no WAL, goes through OS page cache.
   pool, B+ tree range scans ran ~3x faster on 10-key ranges and 24–46x faster on ≥1K-key ranges
   (vs a randomly-built map; 1.6–3x vs an ascending-built one); with a cold pool, full scans were on par."
   (Final wording in M14; locality explanation still a hypothesis until M11.)
-- Hash lookups vs std::unordered_map: NOT MEASURED (M10); old "2.4x" claim removed.
+- Hash lookups (MEASURED, M10): old "2.4x faster" claim is FALSE vs unordered_map (5.2–5.5x slower warm).
+  Draft wording: "Built a disk-backed extendible hash index (splits + directory doubling); warm lookups
+  ~0.3 µs, 4–5x faster than std::map and ~1.7x faster than the B+ tree, ~5x slower than in-memory
+  std::unordered_map; profiled the cost to buffer-pool page accesses, not bucket scans." 
