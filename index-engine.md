@@ -1006,6 +1006,100 @@ depth 17 against a 0.9 µs normal insert.
   (~78 µs at depth 17, more on disk) → every thread stalls; partition into independent tables by top hash bits so
   only one partition doubles at a time.
 
+### Milestone 13: LRU-2 + 📏 sequential flooding experiment
+
+**What I built:** abstract `Replacer` interface (`replacer.h`); `LRUReplacer` now implements it;
+`LRUKReplacer` (`lru_k_replacer.h/.cpp`); `BufferPoolManager(pool_size, dm, ReplacementPolicy::kLRU | kLRU2)`
+calling `RecordAccess` on every fetch/new page; `bench/bench_flooding.cpp`.
+Results with specs: `project3/bench/results/flooding_2026-11-22.md`.
+
+**Plain-language version (say this first)**
+LRU judges a page only by its last use, so a full table scan, where every page is used once,
+looks "recent" and pushes the genuinely popular pages out of the pool. LRU-2 judges a page by its
+second-to-last use: a page touched only once is evicted first. I measured it on my B+ tree with a
+pool holding 9–36% of the tree and Zipfian lookups: during a scan, the share of lookups that had to
+read the disk jumped by 9–11 points under LRU and stayed flat under LRU-2. The price is CPU: my
+LRU-2 uses an ordered set, costing ~1.5 µs extra per lookup.
+
+**MEMORISE**
+- `Replacer`: `RecordAccess(f)` (default no-op), `Pin`, `Unpin`, `Victim`, `Forget` (page deleted → drop history), `Size`
+- Pool calls `RecordAccess` on fetch hit, fetch miss, NewPage; `DeletePage` calls `Forget`
+- **LRU-K rule:** evict the frame whose K-th most recent access is oldest; < K accesses = "infinite" distance → evicted
+  first, oldest first access among them (BusTub tie-break)
+- Storage: per frame `deque` of last ≤ K timestamps (front = ordering key); two `std::set<(time, frame)>`:
+  `fewer_than_k_` and `at_least_k_`; logical clock +1 per access
+- RecordAccess on an evictable frame: erase → update → re-insert (can't mutate a set key in place)
+- Victim clears that frame's history (new page coming)
+- **O(log n)** per operation: an access moves a frame to an arbitrary position, not to an end → needs ordering
+  (2Q is the classic O(1) approximation of LRU-2; CLOCK/clock-sweep in Postgres)
+- Tests: 8 LRU-K unit tests incl. brute force for K = 1, 2, 3 (100k random ops each); flooding unit test
+  (8 frames: after a 30-page scan, LRU misses 4/4 hot pages, LRU-2 misses 0/4); pool correctness with LRU-2
+- Mutation check: inverting the eviction preference → 5 tests fail incl. the flooding test
+
+**Experiment setup**
+- 1M-key B+ tree (5,732 pages, 5,700 leaves), pools 512 / 1,024 / 2,048 frames (9% / 18% / 36% of the tree)
+- Lookups: **page-level Zipf 0.99** — Zipf over 5,700 leaf-sized key ranges (scrambled), uniform key inside the range
+- Warm-up 300k lookups; A: 50k lookups; B: full scan, 1 lookup per 200 scanned keys (~5k lookups); C: 50k lookups after
+  the scan (first 5k = recovery window). OS cache dropped before each phase
+- **disk %** = lookups needing ≥ 1 pool miss (deterministic, same seed); latency = median of 3 reps; 2 process runs
+- Machine: 4 vCPU Xeon @ 2.10GHz (KVM), `-O3 -DNDEBUG`, 2026-11-22
+
+**Results** (disk % identical in both process runs; latency ranges over the 2 runs)
+
+| Pool | Policy | A baseline disk % | **B during scan disk %** | C first 5k after | B mean latency | p50 (A) | p99 (any phase) |
+|---|---|---|---|---|---|---|---|
+| 512 (9%) | LRU | 39.2 | **50.0** | 38.7 | 7.6–8.6 µs | 0.54–0.59 µs | 44–67 µs |
+| 512 (9%) | LRU-2 | 31.7 | **31.1** | 30.5 | 7.2–7.7 µs | 1.80–2.00 µs | 45–69 µs |
+| 1024 (18%) | LRU | 26.6 | **37.9** | 28.7 | 6.8–7.3 µs | 0.46–0.59 µs | |
+| 1024 (18%) | LRU-2 | 21.7 | **21.6** | 20.7 | 5.7–5.9 µs | 1.63–1.86 µs | |
+| 2048 (36%) | LRU | 13.2 | **21.8** | 19.0 | 5.7–6.6 µs | 0.47–0.52 µs | |
+| 2048 (36%) | LRU-2 | 10.6 | **10.2** | 9.9 | 4.6–4.8 µs | 1.74–2.01 µs | |
+
+**What the numbers say**
+- Sequential flooding is real under LRU: disk lookups +9 to +11 points during the scan (+28% to +65% relative);
+  at 36% pool it lingers after the scan (19.0% vs 13.2% baseline in the first 5k lookups).
+- LRU-2 is immune: within 0.6 points of its baseline in every phase; also 20–25% fewer disk lookups at baseline
+  (frequency-aware even without a scan).
+- Mean latency during the scan: LRU-2 15–30% lower at pools ≥ 18%; about even at 9% (CPU overhead eats the gain).
+- **p50 cost:** LRU-2 +1.2–1.5 µs per lookup — 4 page accesses × (set erase + insert, each insert a malloc).
+- **p99 does NOT separate them:** ≥ 10% of lookups hit the device in every config, so p99 = one device read (~45–69 µs).
+- Caveat: after the first re-read in a phase, the OS cache holds the page, so later pool misses are cheap preads;
+  on real cold storage the disk-% difference would matter more than these mean latencies show.
+
+**First design failed — and why (good interview story)**
+Key-level scrambled Zipf + 10 lookups per scanned page + page hit rate metric showed no flooding:
+(1) header/root/internal are always hits, so page hit rate can't drop below ~75% → hides leaf misses;
+(2) scrambled hot keys landed on almost every leaf → no small hot page set to protect;
+(3) lookups refreshed hot pages faster than the scan evicted them. Fixed with page-level skew, disk %, a denser scan.
+
+**Methodology Q&A**
+- *How did you measure it?* Per lookup: pool hit/miss deltas → disk % (deterministic); steady_clock latency;
+  same seed for both policies; 3 reps × 2 processes; scan checksum verified.
+- *What was excluded?* Tree build, warm-up; the scan's own page accesses (only lookups are scored).
+- *What would change in production?* Concurrency (scans and lookups truly parallel, worse flooding); real disk latency;
+  Postgres avoids flooding with a scan ring buffer (256 KB) + clock-sweep; InnoDB with midpoint insertion (new pages
+  enter the "old" sublist and must survive ~1 s to be promoted).
+- *What was the bottleneck?* LRU: the scan evicts hot leaves → device reads. LRU-2: CPU in std::set bookkeeping.
+
+**Interview questions**
+- What is sequential flooding? → a scan bigger than the pool turns every page into "most recent" under LRU and evicts
+  the working set; measured +9–11 points of disk lookups. → *Follow-up:* fixes? LRU-K, 2Q, scan ring buffer (Postgres),
+  midpoint insertion (InnoDB), or a scan hint to bypass the cache.
+- Explain LRU-2 eviction. → oldest second-to-last access; frames used once go first. → *Follow-up:* why O(log n)?
+  an access moves the frame to an arbitrary rank; exact needs a priority structure; 2Q approximates in O(1).
+- Why didn't p99 improve? → in every config ≥ 10% of lookups read the device, so p99 is one device read; the effect
+  shows in disk % and mean latency.
+- Why did LRU-2 make the median slower? → std::set erase/insert per page access (with malloc); an intrusive or O(1)
+  approximation (2Q, CLOCK-Pro) would remove most of it.
+- Why does LRU-2 beat LRU even without a scan? → Zipf traffic has frequency information LRU ignores; one-off cold pages
+  evict hot ones under LRU.
+
+**Scaling questions**
+- Many threads? → my LRU-K mutates a shared std::set on every access → a global latch on the hottest path; production
+  pools use CLOCK (a hit just sets a reference bit, no latch) or partitioned replacers.
+- 100x bigger pool? → O(log n) grows slowly (log2 of 1M ≈ 20) but the per-access malloc and cache misses in the tree
+  structure grow; CLOCK-style policies scale better.
+
 ---
 
 ## Repo housekeeping
@@ -1025,7 +1119,7 @@ All numbers: **NOT MEASURED** yet.
 | 2 | Point lookup: extendible hash vs `std::unordered_map` (+ `std::map`) | Warm hit: ext hash 271–324 ns vs unordered_map (mixing hash) 52–62 ns → **5.2–5.5x slower**; vs std::map 1.3–1.45 µs → 4.1–4.9x faster; vs B+ tree 493–518 ns → 1.5–1.9x faster. Cold + OS dropped: 13.8–15.5 µs (≈ B+ tree). Bottleneck = buffer-pool page accesses (bucket-size sweep) | 2026-11-22, 4 vCPU Xeon 2.10GHz KVM, -O3; 1M even int64 keys, random insert order; 1M random hit lookups/run warm, 10k cold; median of 5 × 4 processes; 0 misses verified warm; see M10 |
 | 3 | Cache misses (perf stat / cachegrind): B+ tree vs `std::map` | SIMULATED (cachegrind): B+ tree 0.146 L1d / 0.130 LL misses per key vs std::map 1.00 / ~1.00 (both build orders), with 31 vs 22 instructions/key. Real perf counters: NOT MEASURED (laptop). Map random vs ascending: equal simulated misses; nodes 64 B apart vs 18.8 MB median → prefetch/TLB explanation (real dTLB counts NOT MEASURED) | 2026-11-22, valgrind 3.22 cachegrind, L1d 32 KB 8-way, LL 8 MB 16-way, 64 B lines; 1M keys; (R5−R0)/5e6 per key; see M11 |
 | 4 | Extendible hash growth under Zipfian skew | Doublings at the same distinct-key counts for uniform, Zipf 0.99 and Zipf 1.2 (depth 10 at 107,739 / 109,268 / 109,336 keys); skew only raises duplicate inserts (9% / 70% / 92% of 2M attempts). Doubling insert: 78 µs at depth 17 vs 0.91 µs median insert | 2026-11-22, 4 vCPU Xeon 2.10GHz KVM, -O3; universe 10M keys; bucket 255, mixing hash, in-memory (0 misses); 20M-key uniform run for large depth; see M12 |
-| 5 | Sequential flooding: LRU vs fix, hit rate + p99 | NOT MEASURED | |
+| 5 | Sequential flooding: LRU vs LRU-2, hit rate + p99 | Disk lookups during a full scan: LRU 39.2→50.0% (pool 9%), 26.6→37.9% (18%), 13.2→21.8% (36%); LRU-2 31.7→31.1%, 21.7→21.6%, 10.6→10.2%. Mean latency during scan 15–30% lower with LRU-2 (pools ≥ 18%); p99 equal (~45–69 µs, one device read); LRU-2 p50 +1.2–1.5 µs CPU overhead | 2026-11-22, 4 vCPU Xeon 2.10GHz KVM, -O3; 1M-key B+ tree, pools 512/1024/2048 frames; page-level Zipf 0.99; OS cache dropped per phase; 3 reps × 2 processes; see M13 |
 
 ---
 
