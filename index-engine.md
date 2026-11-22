@@ -923,6 +923,89 @@ Native Linux only (not most VMs, usually not WSL2, not macOS).
 - Make std::map faster without changing the structure? → arena/pool allocator that hands out nodes in order,
   or rebuild in sorted order → behaves like the ascending case.
 
+### Milestone 12: 📏 Extendible hashing growth under Zipfian skew
+
+**What I built:** `bench/zipf.h` (Gray/YCSB Zipfian generator) and `bench/hash_growth.cpp`.
+Results with specs: `project3/bench/results/hash_growth_2026-11-22.md`.
+
+**Plain-language version (say this first)**
+Zipfian means a few keys are extremely popular. I fed uniform and Zipfian insert streams
+into the hash table and tracked its growth. Skew did NOT change the table's shape: the
+directory doubled at the same number of distinct keys for every stream, because the table
+stores each key once and a good hash spreads distinct keys evenly. What skew changed was
+how many inserts were repeats (70–92%), so the table grew much more slowly per insert.
+I also timed directory doublings: they get more expensive as the directory grows, 78 µs at
+depth 17 against a 0.9 µs normal insert.
+
+**Setup (MEMORISE)**
+- Streams: uniform, Zipf θ=0.99 (YCSB default), Zipf θ=1.2; 2M insert attempts each; universe 10M keys
+- Generator checked: top-key share measured 0.0559 vs theory 0.0554 (θ=0.99); 0.1861 vs 0.1854 (θ=1.2)
+- Table: bucket size 255, splitmix64 mixing hash, pool large enough → **0 pool misses** (pure in-memory growth)
+- Extra run: uniform, 20M distinct keys, 1 GB pool, to measure doubling cost at depth up to 17
+- Machine: 4 vCPU Xeon @ 2.10GHz (KVM), `-O3 -DNDEBUG`, 2026-11-22
+
+**Results — shape depends on DISTINCT keys only**
+
+| Stream | After 2M attempts: distinct keys | Duplicate rate | Global depth | Buckets | Doubling to depth 10 / 11 / 12 at distinct keys |
+|---|---|---|---|---|---|
+| Uniform | 1,812,537 | 9.4% | 14 | 8,290 | 107,739 / 215,381 / 429,169 |
+| Zipf 0.99 | 603,344 | 69.8% | 12 | 4,082 | 109,268 / 212,719 / 424,992 |
+| Zipf 1.2 | 163,565 | 91.8% | 10 | 1,024 | 109,336 / — / — |
+
+- Doublings happen every time distinct keys roughly double, ~107k–109k keys at depth 10 for all streams
+  (≈ 2^10 buckets × ~105 keys).
+- Buckets per local depth at the end: almost all at g or g−1 (e.g. uniform d=13: 8,094, d=14: 196) → even spread.
+- Avg bucket fill oscillates 0.57–0.86 in waves (fills up → splits → half-empty buckets).
+
+**Results — doubling cost vs depth (uniform, 20M keys)**
+
+| New depth | Directory entries | Time of the doubling insert |
+|---|---|---|
+| 10–12 | 1,024–4,096 | 5–10 µs |
+| 13 | 8,192 | 10 µs |
+| 14 | 16,384 | 17 µs |
+| 15 | 32,768 | 26 µs |
+| 16 | 65,536 | 38 µs |
+| 17 | 131,072 | **78 µs** |
+
+- Normal inserts (20M-key table): p50 0.91 µs, p99 2.07 µs, p99.9 19.8 µs, max 5.0 ms
+- At large depth, cost ≈ doubles per level (copying 2^g entries + allocating 2^g/1024 new directory pages)
+- Extrapolation (NOT measured): depth 19 doubling ≈ 300 µs
+- Caveat: the max normal insert (0.7–5 ms) exceeds every doubling → the extreme tail is not caused by doublings;
+  most likely OS/VM preemption, not investigated
+
+**What this means (the honest finding)**
+- With unique keys and a good hash, **Zipfian skew does not distort growth**: the directory size is a function of
+  distinct keys, not of how often they're inserted. Skew only adds duplicate (rejected) inserts.
+- Skew WOULD matter with: (1) the identity hash on patterned keys (M8: depth 13 vs 4); (2) duplicate keys
+  allowed (a hot key with more copies than a bucket holds can never be split → needs overflow pages; my build
+  throws); (3) concurrency — every write to a hot key hits the same bucket latch (hot spot).
+- Bug I made and fixed: built the Zipf generator for the uniform run too; its setup sums over the whole universe
+  (4×10^18 terms) → never finished; found because a 1-minute run used 10 minutes of CPU.
+
+**Methodology Q&A**
+- *How did you measure it?* Counters from the table (depth, buckets, splits, doublings) at 10 checkpoints; every
+  insert timed with steady_clock; doubling inserts separated from normal ones; generator validated against theory.
+- *What was excluded?* Disk I/O (pool large enough, 0 misses); generating keys is outside the timed insert.
+- *What would change in production?* Concurrency (doubling needs an exclusive directory latch → stalls all
+  threads for its duration); disk-resident directory (doubling writes 2^g/1024 pages); duplicates/overflow.
+- *What was the bottleneck?* Growth: number of distinct keys. Latency spike: directory copy at doubling, O(2^g).
+
+**Interview questions**
+- Does Zipfian skew hurt extendible hashing? → not its growth, with unique keys and a good hash: doublings at the
+  same distinct-key counts (107–109k for depth 10 across all streams). → *Follow-up:* when would it hurt? Identity
+  hash, duplicate keys (unsplittable bucket), or hot-bucket contention under concurrency.
+- How expensive is directory doubling? → measured: 78 µs at depth 17 vs 0.9 µs median insert; doubles per level.
+  → *Follow-up:* fix? incremental/lazy doubling, bounded per-page directories (header → directories), or linear hashing.
+- How did you validate the Zipf generator? → top-key share vs theory 1/ζ(n, θ): 0.0559 vs 0.0554.
+
+**Scaling questions**
+- 1B distinct keys? → depth ≈ 23 (8M entries, 32 MB directory); one doubling copies 16 MB → milliseconds of stall
+  (extrapolated); beyond my max depth 19 anyway → needs a multi-level directory.
+- Many writer threads + doubling? → doubling holds the directory latch exclusively for its whole duration
+  (~78 µs at depth 17, more on disk) → every thread stalls; partition into independent tables by top hash bits so
+  only one partition doubles at a time.
+
 ---
 
 ## Repo housekeeping
@@ -941,7 +1024,7 @@ All numbers: **NOT MEASURED** yet.
 | 1 | Range scan: B+ tree vs `std::map`, 1M keys, warm + cold | Warm: 2.9–3.3x faster (10-key ranges), 24–46x (≥1K-key ranges) vs map built in random order; 1.6–3.0x vs map built in ascending order. Cold pool + OS cache dropped: full scan 149–157 ms ≈ map (random) 139–145 ms; 10-key range 15.7–16.3 µs vs map 1.3–1.5 µs | 2026-11-18, 4 vCPU Xeon 2.10GHz KVM, -O3; 1M int64 keys, random insert order; median of 5 runs × 3 processes; only scan loop timed; warm = 0 misses verified; cold = empty pool + fadvise DONTNEED (0.0% resident). See M9 |
 | 2 | Point lookup: extendible hash vs `std::unordered_map` (+ `std::map`) | Warm hit: ext hash 271–324 ns vs unordered_map (mixing hash) 52–62 ns → **5.2–5.5x slower**; vs std::map 1.3–1.45 µs → 4.1–4.9x faster; vs B+ tree 493–518 ns → 1.5–1.9x faster. Cold + OS dropped: 13.8–15.5 µs (≈ B+ tree). Bottleneck = buffer-pool page accesses (bucket-size sweep) | 2026-11-22, 4 vCPU Xeon 2.10GHz KVM, -O3; 1M even int64 keys, random insert order; 1M random hit lookups/run warm, 10k cold; median of 5 × 4 processes; 0 misses verified warm; see M10 |
 | 3 | Cache misses (perf stat / cachegrind): B+ tree vs `std::map` | SIMULATED (cachegrind): B+ tree 0.146 L1d / 0.130 LL misses per key vs std::map 1.00 / ~1.00 (both build orders), with 31 vs 22 instructions/key. Real perf counters: NOT MEASURED (laptop). Map random vs ascending: equal simulated misses; nodes 64 B apart vs 18.8 MB median → prefetch/TLB explanation (real dTLB counts NOT MEASURED) | 2026-11-22, valgrind 3.22 cachegrind, L1d 32 KB 8-way, LL 8 MB 16-way, 64 B lines; 1M keys; (R5−R0)/5e6 per key; see M11 |
-| 4 | Extendible hash growth under Zipfian skew | NOT MEASURED | |
+| 4 | Extendible hash growth under Zipfian skew | Doublings at the same distinct-key counts for uniform, Zipf 0.99 and Zipf 1.2 (depth 10 at 107,739 / 109,268 / 109,336 keys); skew only raises duplicate inserts (9% / 70% / 92% of 2M attempts). Doubling insert: 78 µs at depth 17 vs 0.91 µs median insert | 2026-11-22, 4 vCPU Xeon 2.10GHz KVM, -O3; universe 10M keys; bucket 255, mixing hash, in-memory (0 misses); 20M-key uniform run for large depth; see M12 |
 | 5 | Sequential flooding: LRU vs fix, hit rate + p99 | NOT MEASURED | |
 
 ---
@@ -958,8 +1041,9 @@ no WAL, goes through OS page cache.
 - Built a C++17 disk-backed storage engine: paged storage layer (4KB pages),
   buffer pool with LRU replacement, B+ tree with split/merge (built and tested: insert splits,
   delete borrow/merge, root split/collapse, leaf-chain range scans).
-- Extendible hashing with bucket splits and directory doubling; profiled growth
-  under Zipfian key skew. *(NOT MEASURED)*
+- Extendible hashing with bucket splits and directory doubling; profiled growth under Zipfian key skew
+  (MEASURED, M12): "skew (θ 0.99/1.2) left directory growth unchanged per distinct key — doublings at the
+  same key counts as uniform; measured doubling cost rising to 78 µs at depth 17 (vs 0.9 µs median insert)." 
 - Range scans (MEASURED, M9), draft wording: "Benchmarked vs std::map on 1M keys: with a warm buffer
   pool, B+ tree range scans ran ~3x faster on 10-key ranges and 24–46x faster on ≥1K-key ranges
   (vs a randomly-built map; 1.6–3x vs an ascending-built one); with a cold pool, full scans were on par."
