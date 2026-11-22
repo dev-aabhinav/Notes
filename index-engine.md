@@ -6,12 +6,12 @@ Repo: `dev-aabhinav/project3` · C++17 · CMake · GoogleTest
 
 ## One-line pitch (30 seconds)
 
-A single-threaded C++17 storage engine that stores data in 4KB pages on disk,
-caches them in a buffer pool with pin counts and an O(1) LRU replacer, and
-builds two disk-backed indexes on top: a B+ tree (point + range queries) and
-extendible hashing (point queries). I benchmarked both against the STL
-containers, warm and cold, and ran a sequential-flooding experiment on the
-buffer pool. *(Benchmark numbers: NOT MEASURED yet.)*
+A single-threaded C++17 storage engine that keeps data in 4 KB pages on disk, caches them in a buffer pool
+with pin counts and an O(1) LRU replacer (plus LRU-2), and builds two disk-backed indexes on top: a B+ tree
+(splits, merges, range scans) and extendible hashing. I benchmarked both honestly: warm B+ tree range scans
+were 2.7–3.3x faster than std::map on short ranges and 24–46x on long ones (but on par when cold); the hash
+index was ~5x slower than std::unordered_map, which I traced to buffer-pool page accesses; and I reproduced
+sequential flooding under LRU and removed it with LRU-2.
 
 ---
 
