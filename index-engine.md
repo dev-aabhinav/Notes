@@ -702,7 +702,7 @@ B+ cold pool ~10 ns, B+ cold + OS dropped ~150 ns (5,702 device reads ≈ 26 µs
 - Cold pool but OS cached: a pool miss costs ~1–2 µs (syscall + 4KB copy); still faster than
   std::map (random) for ranges ≥ 1,000.
 
-**Why (hypothesis until M11 measures cache misses):** std::map iteration follows a pointer to
+**Why — CORRECTED in M11 (see there): miss counts are equal; cost per miss differs (prefetch/TLB). Original hypothesis was:** std::map iteration follows a pointer to
 a separately allocated node per key; in random allocation order consecutive keys are far apart in
 memory → likely a cache/TLB miss per key. B+ leaves hold keys contiguously → ~8 keys per cache line,
 hardware prefetch works. NOT yet proven: needs cache-miss counts (M11).
@@ -838,6 +838,91 @@ of ~5x latency vs an in-memory hash map when warm.
 - Every directory access goes through the buffer pool (an extra page access per lookup).
 - Single-threaded, synchronous I/O; VM cold numbers may be optimistic (host cache).
 
+### Milestone 11: 📏 Cache misses — testing the "locality" claim
+
+**What I built:** `bench/cache_probe.cpp` (runs one workload R times, no timing inside),
+`bench/cachegrind_cache_misses.sh` (simulated cache, runs in the cloud VM),
+`bench/perf_cache_misses.sh` (real hardware counters, for a native Linux laptop),
+`bench/map_node_gaps.cpp`. Results: `project3/bench/results/cache_misses_cachegrind_2026-11-22.md`.
+
+**Plain-language version (say this first)**
+I counted cache misses instead of guessing. In a simulated cache, my B+ tree takes about
+one miss per 7 keys scanned, std::map about one miss per key, so the tree is ~7x better
+even though it runs more instructions per key. But the simulation also showed something I
+didn't expect: a std::map built in random order and one built in ascending order take the
+SAME number of misses, yet the random one is 14x slower. The reason is placement: the
+ascending map's nodes sit exactly 64 bytes apart, so the CPU's prefetcher fetches them
+ahead of time; the random map's nodes are megabytes apart, so every miss costs full RAM
+latency. Same number of misses, very different cost per miss.
+
+**Method (MEMORISE)**
+- Probe runs a workload R times; measure R=0 and R=high, subtract → setup (building, warming) cancels
+- Workloads, both 1M keys per repetition: full scan; 1,000 ranges × 1,000 keys
+- **cachegrind:** `--cache-sim=yes --D1=32768,8,64 --LL=8388608,16,64` (L1d 32 KB, LL 8 MB, set explicitly
+  because the VM reports a 260 MB L3); deterministic → R=5 is enough
+- **perf (laptop):** R=20, REPEAT=3 (separate processes → setup noise; R=5 gave a wrong 0.74 ns/key)
+- perf is NOT usable in the cloud VM ("no PMU driver"); task-clock (software) works and matches M9
+
+**Results — SIMULATED (cachegrind), per key scanned**
+
+| Structure | Workload | Instructions | L1d misses | LL data misses |
+|---|---|---|---|---|
+| std::map (random build) | full scan | 21.8 | 1.00 | 0.99 |
+| std::map (ascending build) | full scan | 21.7 | 1.00 | 1.00 |
+| B+ tree (warm) | full scan | 31.2 | **0.146** | **0.130** |
+| std::map (random) | 1k × 1k ranges | 24.9 | 1.02 | 0.88 |
+| std::map (ascending) | 1k × 1k ranges | 24.9 | 1.02 | 0.90 |
+| B+ tree (warm) | 1k × 1k ranges | 34.3 | **0.177** | **0.081** |
+
+Wall time per key (task-clock, 2 runs): map random 141–153 ns · map ascending 6–9 ns · B+ tree ~4.2 ns.
+
+**Node placement (`map_node_gaps`):** ascending build → 100% of consecutive nodes exactly +64 B apart
+(64 per 4 KB page); random build → median gap 18.8 MB, 0% on the same 4 KB page.
+
+**Conclusions — what is proven and what is not**
+- PROVEN (simulated): B+ tree scans take ~7x fewer L1 misses and ~7–11x fewer last-level misses per key
+  than std::map, with ~1.4x MORE instructions → the speed-up comes from memory behaviour, not less work.
+  Why 0.146: the scan reads only `values[]` (8 int64 per 64 B line → 0.125/key) + per-leaf overhead.
+- CORRECTED: my M9 explanation "the random map takes more cache misses" is wrong as stated — miss COUNTS
+  are equal. The 14x gap is the COST per miss: ascending nodes form a +64 B stride the hardware prefetcher
+  follows, and stay on the same page (TLB hits); random nodes defeat both. cachegrind models neither
+  prefetching nor the TLB, which is exactly why it shows equal counts.
+- NOT YET MEASURED: real hardware counters (LLC-load-misses, dTLB-load-misses). Prediction to test on the
+  laptop: map_random ≫ map_asc on dTLB-load-misses and on LLC-load-misses (prefetched lines become hits).
+- Until the laptop run: say "simulated" for every miss number.
+
+**Methodology Q&A**
+- *How did you measure it?* Counted, not timed: cachegrind with an explicit 32 KB / 8 MB cache model;
+  R=5 minus R=0 per structure/workload; checksums equal; B+ tree verified warm.
+- *What was excluded?* Building the structures and warming the pool (cancelled by the subtraction).
+- *What would change on real hardware?* Prefetchers and TLB (not simulated) — which is why the two maps
+  differ in time but not in simulated misses; real cache sizes/associativity differ from the model.
+- *What was the bottleneck?* std::map (random): memory latency per node, unhidden by prefetch, likely plus
+  TLB misses. B+ tree: ~1 miss per 8 values + iterator instructions.
+
+**Laptop steps (real perf)** — see `project3/bench/README.md`:
+`sudo apt install linux-tools-common linux-tools-$(uname -r)`; `sudo sysctl kernel.perf_event_paranoid=1`;
+build; `perf stat -e cycles,cache-misses true` (sanity); `./bench/perf_cache_misses.sh | tee perf_results.txt`.
+Native Linux only (not most VMs, usually not WSL2, not macOS).
+
+**Interview questions**
+- Prove the B+ tree is faster because of locality. → simulated counts: 0.146 vs 1.00 L1 misses/key, 0.13 vs
+  0.99 LL misses/key, despite 31 vs 22 instructions/key. → *Follow-up:* real hardware? Script ready; not run yet.
+- Why does insertion order change std::map speed 14x? → same miss count, but ascending nodes are 64 B apart
+  (prefetcher + TLB friendly), random ones megabytes apart. → *Follow-up:* how did you check? Measured the
+  address gaps; and cachegrind's equal counts ruled out "more misses".
+- Why didn't you just use perf? → the cloud VM exposes no hardware counters; I used a simulator, labelled it,
+  and wrote the perf script for real hardware.
+- What went wrong in your measurements? → (1) node-gap test first reused freed memory → both maps looked
+  scattered; (2) perf subtraction with R=5 was swamped by setup noise; both caught by cross-checking against
+  other measurements.
+
+**Scaling questions**
+- 1B keys? → std::map: 64 GB of nodes, every scan step a likely TLB + cache miss → huge pages (2 MB) cut TLB
+  misses; a B+ tree keeps the 8-keys-per-line property at any size.
+- Make std::map faster without changing the structure? → arena/pool allocator that hands out nodes in order,
+  or rebuild in sorted order → behaves like the ascending case.
+
 ---
 
 ## Repo housekeeping
@@ -855,7 +940,7 @@ All numbers: **NOT MEASURED** yet.
 | 0 | B+ tree shape at 1M keys (structural, no timing) | height 3; ascending 7,812 leaves / fill 0.502; random 5,685 leaves / fill 0.690 | `tools/tree_shape 1000000`, 2026-11-15, int64 keys, leaf max 255, internal max 340; deterministic (seeded shuffle) |
 | 1 | Range scan: B+ tree vs `std::map`, 1M keys, warm + cold | Warm: 2.9–3.3x faster (10-key ranges), 24–46x (≥1K-key ranges) vs map built in random order; 1.6–3.0x vs map built in ascending order. Cold pool + OS cache dropped: full scan 149–157 ms ≈ map (random) 139–145 ms; 10-key range 15.7–16.3 µs vs map 1.3–1.5 µs | 2026-11-18, 4 vCPU Xeon 2.10GHz KVM, -O3; 1M int64 keys, random insert order; median of 5 runs × 3 processes; only scan loop timed; warm = 0 misses verified; cold = empty pool + fadvise DONTNEED (0.0% resident). See M9 |
 | 2 | Point lookup: extendible hash vs `std::unordered_map` (+ `std::map`) | Warm hit: ext hash 271–324 ns vs unordered_map (mixing hash) 52–62 ns → **5.2–5.5x slower**; vs std::map 1.3–1.45 µs → 4.1–4.9x faster; vs B+ tree 493–518 ns → 1.5–1.9x faster. Cold + OS dropped: 13.8–15.5 µs (≈ B+ tree). Bottleneck = buffer-pool page accesses (bucket-size sweep) | 2026-11-22, 4 vCPU Xeon 2.10GHz KVM, -O3; 1M even int64 keys, random insert order; 1M random hit lookups/run warm, 10k cold; median of 5 × 4 processes; 0 misses verified warm; see M10 |
-| 3 | Cache misses (perf stat / cachegrind): B+ tree vs `std::map` | NOT MEASURED — locality explanation for M9 results is a **hypothesis** | |
+| 3 | Cache misses (perf stat / cachegrind): B+ tree vs `std::map` | SIMULATED (cachegrind): B+ tree 0.146 L1d / 0.130 LL misses per key vs std::map 1.00 / ~1.00 (both build orders), with 31 vs 22 instructions/key. Real perf counters: NOT MEASURED (laptop). Map random vs ascending: equal simulated misses; nodes 64 B apart vs 18.8 MB median → prefetch/TLB explanation (real dTLB counts NOT MEASURED) | 2026-11-22, valgrind 3.22 cachegrind, L1d 32 KB 8-way, LL 8 MB 16-way, 64 B lines; 1M keys; (R5−R0)/5e6 per key; see M11 |
 | 4 | Extendible hash growth under Zipfian skew | NOT MEASURED | |
 | 5 | Sequential flooding: LRU vs fix, hit rate + p99 | NOT MEASURED | |
 
